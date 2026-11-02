@@ -5,7 +5,7 @@
 
 use crate::config_store::DeviceConfig;
 use log::{debug, info};
-use ratv::discovery::{Device, MDNS_PORT, ScanOptions, ServiceKind, scan};
+use ratv::discovery::{Device, MDNS_PORT, ScanOptions, ServiceKind, scan, scan_until};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
@@ -63,7 +63,7 @@ pub async fn scan_apple_tvs(address: Option<IpAddr>) -> Result<Vec<Device>, ratv
     let mut devices = scan(&unicast).await?;
     if devices.is_empty() {
         info!("no answer from {ip}, scanning the network");
-        devices = scan(&options).await?;
+        devices = scan_until(&options, |d| d.addresses.contains(&ip) && has_endpoints(d)).await?;
         devices.retain(|d| d.addresses.contains(&ip));
     }
     devices.retain(is_apple_tv);
@@ -92,10 +92,17 @@ pub async fn find(cfg: &DeviceConfig) -> Result<Option<Device>, ratv::Error> {
 
     let mut options = ScanOptions::default();
     options.timeout = SCAN_TIMEOUT;
-    Ok(scan(&options)
+    let found = |d: &Device| cfg.matches(device_ids(d));
+    Ok(scan_until(&options, |d| found(d) && has_endpoints(d))
         .await?
         .into_iter()
-        .find(|d| cfg.matches(device_ids(d))))
+        .find(found))
+}
+
+/// Returns `true` if the Companion and AirPlay services have answered. The connect uses both.
+fn has_endpoints(device: &Device) -> bool {
+    device.service(ServiceKind::Companion).is_some()
+        && device.service(ServiceKind::AirPlay).is_some()
 }
 
 /// Update the identifiers, name and address of a configuration from a discovered device.
