@@ -444,7 +444,7 @@ impl Handler<DeviceEvent> for Controller {
                 // than the credentials and settings of the controller, for example after pairing
                 // again.
                 let own = &mut device.cfg;
-                let address = !own.manual_address && own.address != cfg.address;
+                let address = own.address != cfg.address;
                 if own.name == cfg.name && own.known_ids == cfg.known_ids && !address {
                     return;
                 }

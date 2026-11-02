@@ -100,6 +100,9 @@ pub async fn find(cfg: &DeviceConfig) -> Result<Option<Device>, ratv::Error> {
 
 /// Update the identifiers, name and address of a configuration from a discovered device.
 ///
+/// The address changes only if the device does not have the stored address anymore. This is
+/// also done for an address entered by the user: the device matched by its identifiers.
+///
 /// Returns `true` if something changed.
 pub fn update_config(cfg: &mut DeviceConfig, device: &Device) -> bool {
     let mut changed = false;
@@ -113,15 +116,18 @@ pub fn update_config(cfg: &mut DeviceConfig, device: &Device) -> bool {
         cfg.name = name.to_string();
         changed = true;
     }
-    if let Some(ip) = device.addresses.first().copied()
-        && cfg.address != Some(ip)
-        && !cfg.manual_address
-    {
+    if let Some(ip) = new_address(cfg.address, &device.addresses) {
         info!("[{}] address changed to {ip}", cfg.name);
         cfg.address = Some(ip);
         changed = true;
     }
     changed
+}
+
+/// The address to store, if the device does not have the stored one anymore.
+fn new_address(stored: Option<IpAddr>, found: &[IpAddr]) -> Option<IpAddr> {
+    let first = found.first().copied()?;
+    (!stored.is_some_and(|a| found.contains(&a))).then_some(first)
 }
 
 /// Add the ids that are not known yet and return them. Known ids are kept: a scan may not see
@@ -179,6 +185,17 @@ mod tests {
             merge_ids(&mut known, ["c", "a"].into_iter()).collect::<Vec<_>>()
         );
         assert_eq!(vec!["a", "b", "c"], known);
+    }
+
+    #[test]
+    fn address_changes_only_when_gone() {
+        let a: IpAddr = "10.0.30.6".parse().expect("ip");
+        let b: IpAddr = "10.0.30.7".parse().expect("ip");
+        let v6: IpAddr = "fe80::1".parse().expect("ip");
+        assert_eq!(None, new_address(Some(a), &[b, a]));
+        assert_eq!(None, new_address(Some(a), &[]));
+        assert_eq!(Some(b), new_address(Some(a), &[b, v6]));
+        assert_eq!(Some(b), new_address(None, &[b]));
     }
 
     #[test]

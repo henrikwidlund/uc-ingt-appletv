@@ -556,7 +556,9 @@ impl Controller {
                         // Keep the id from the first pairing.
                         found.id.clone_from(&cfg.id);
                         found.name.clone_from(&cfg.name);
-                        if cfg.manual_address {
+                        if cfg.manual_address
+                            && cfg.address.is_some_and(|a| device.addresses.contains(&a))
+                        {
                             found.address = cfg.address;
                         }
                         act.pair(
