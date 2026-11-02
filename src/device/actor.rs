@@ -835,53 +835,38 @@ impl AppleTvActor {
         let generation = self.generation;
 
         if tv.companion().is_some() {
-            if self
+            let fetch_apps = self
                 .apps_fetched
-                .is_none_or(|t| t.elapsed() + APPS_MARGIN >= POLL_INTERVAL)
-            {
-                let apps_tv = tv.clone();
-                ctx.spawn(async move { apps_tv.apps().await }.into_actor(self).map(
-                    move |result, act, _| match result {
-                        Ok(apps) if act.generation == generation => {
-                            act.apps_fetched = Some(Instant::now());
-                            let apps = apps
-                                .into_iter()
-                                .map(|a| AppInfo {
-                                    bundle_id: a.bundle_id,
-                                    name: a.name,
-                                })
-                                .collect();
-                            let dirty = act.s.set_apps(apps);
-                            if !dirty.is_empty() {
-                                act.save_cache();
-                                act.emit(dirty);
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(e) => warn!("[{}] app list failed: {e}", act.cfg.name),
-                    },
-                ));
-            }
-            let accounts_tv = tv.clone();
-            ctx.spawn(
-                async move { accounts_tv.accounts().await }
-                    .into_actor(self)
-                    .map(move |result, act, _| match result {
-                        Ok(accounts) if act.generation == generation => {
-                            let accounts = accounts
-                                .into_iter()
-                                .map(|a| AccountInfo {
-                                    id: a.id,
-                                    name: a.name,
-                                })
-                                .collect();
-                            let dirty = act.s.set_accounts(accounts);
-                            act.emit(dirty);
-                        }
-                        Ok(_) => {}
-                        Err(e) => warn!("[{}] account list failed: {e}", act.cfg.name),
-                    }),
-            );
+                .is_none_or(|t| t.elapsed() + APPS_MARGIN >= POLL_INTERVAL);
+            let companion_tv = tv.clone();
+            // One after the other: requests that time out together count as one silent period
+            // only, and ratv closes the connection after two.
+            let fut = async move {
+                let apps = if fetch_apps {
+                    Some(companion_tv.apps().await)
+                } else {
+                    None
+                };
+                (apps, companion_tv.accounts().await)
+            };
+            ctx.spawn(fut.into_actor(self).map(move |(apps, accounts), act, _| {
+                act.apply_apps(apps, generation);
+                match accounts {
+                    Ok(accounts) if act.generation == generation => {
+                        let accounts = accounts
+                            .into_iter()
+                            .map(|a| AccountInfo {
+                                id: a.id,
+                                name: a.name,
+                            })
+                            .collect();
+                        let dirty = act.s.set_accounts(accounts);
+                        act.emit(dirty);
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("[{}] account list failed: {e}", act.cfg.name),
+                }
+            }));
         }
 
         if tv.mrp().is_some() {
@@ -901,6 +886,32 @@ impl AppleTvActor {
                         Err(e) => warn!("[{}] AirPlay scan failed: {e}", act.cfg.name),
                     }),
             );
+        }
+    }
+
+    fn apply_apps(
+        &mut self,
+        result: Option<Result<Vec<ratv::companion::App>, ratv::Error>>,
+        generation: u64,
+    ) {
+        match result {
+            Some(Ok(apps)) if self.generation == generation => {
+                self.apps_fetched = Some(Instant::now());
+                let apps = apps
+                    .into_iter()
+                    .map(|a| AppInfo {
+                        bundle_id: a.bundle_id,
+                        name: a.name,
+                    })
+                    .collect();
+                let dirty = self.s.set_apps(apps);
+                if !dirty.is_empty() {
+                    self.save_cache();
+                    self.emit(dirty);
+                }
+            }
+            Some(Err(e)) => warn!("[{}] app list failed: {e}", self.cfg.name),
+            _ => {}
         }
     }
 
