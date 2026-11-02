@@ -138,6 +138,8 @@ pub struct AppleTvActor {
     item_art: ItemArtwork,
     /// Cached result of [`Self::find_http_base`]. Reset on close.
     http_base: Option<String>,
+    /// Endpoints of the last successful connect. Tried before discovery on reconnect.
+    endpoints: Option<Endpoints>,
     /// Mute and power set by the last commands. Used for toggles until the device reports them.
     expected_mute: Option<bool>,
     expected_power: Option<Power>,
@@ -187,6 +189,7 @@ impl AppleTvActor {
             shown_file: None,
             item_art: ItemArtwork::default(),
             http_base: None,
+            endpoints: None,
             expected_mute: None,
             expected_power: None,
             cmd_lock: Arc::default(),
@@ -274,16 +277,28 @@ impl AppleTvActor {
         let mut options = ClientOptions::default();
         options.name.clone_from(&self.ctx.client_name);
 
+        let known = self.endpoints;
+
         let fut = async move {
+            if let Some(ep) = known {
+                match AppleTv::connect(&ep, &cfg.credentials, &options).await {
+                    Ok(tv) => return (None, Ok((tv, ep))),
+                    Err(e) if e.is_auth() => return (None, Err(Some(e))),
+                    Err(e) => debug!("[{}] last endpoints failed, scanning: {e}", cfg.name),
+                }
+            }
             let device = match discovery::find(&cfg).await {
                 Ok(Some(d)) => d,
                 Ok(None) => return (None, Err(None)),
                 Err(e) => return (None, Err(Some(e))),
             };
             let changed = discovery::update_config(&mut cfg, &device);
-            let result =
-                AppleTv::connect(&Endpoints::from(&device), &cfg.credentials, &options).await;
-            (changed.then_some(cfg), result.map_err(Some))
+            let ep = Endpoints::from(&device);
+            let result = AppleTv::connect(&ep, &cfg.credentials, &options).await;
+            (
+                changed.then_some(cfg),
+                result.map(|tv| (tv, ep)).map_err(Some),
+            )
         };
         ctx.spawn(fut.into_actor(self).map(move |(cfg, result), act, ctx| {
             // What discovery found is valid also for an old attempt.
@@ -301,7 +316,7 @@ impl AppleTvActor {
                     "[{}] result of an old connect attempt ignored",
                     act.cfg.name
                 );
-                if let Ok(tv) = result {
+                if let Ok((tv, _)) = result {
                     actix::spawn(async move {
                         let _ = tv.close().await;
                     });
@@ -309,15 +324,19 @@ impl AppleTvActor {
                 return;
             }
             match result {
-                Ok(tv) if act.want && act.status == DeviceStatus::Connecting => {
+                Ok((tv, ep)) if act.want && act.status == DeviceStatus::Connecting => {
+                    if act.cfg_version == version {
+                        act.endpoints = Some(ep);
+                    }
                     act.on_connected(tv, ctx);
                 }
-                Ok(tv) => {
+                Ok((tv, _)) => {
                     actix::spawn(async move {
                         let _ = tv.close().await;
                     });
                 }
                 Err(Some(e)) if e.is_auth() => {
+                    act.endpoints = None;
                     warn!(
                         "[{}] pairing is not valid anymore, pair again: {e}",
                         act.cfg.name
@@ -1188,6 +1207,9 @@ impl Handler<UpdateConfig> for AppleTvActor {
             || !discovery::same_ids(&cfg.known_ids, &self.cfg.known_ids);
         self.set_config(cfg);
         self.cfg_version += 1;
+        if reconnect {
+            self.endpoints = None;
+        }
         if reconnect && self.want {
             info!("[{}] configuration changed, reconnecting", self.cfg.name);
             self.lost_connection(ctx);
