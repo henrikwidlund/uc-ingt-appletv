@@ -21,7 +21,7 @@ ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "292240d785348b2b6
 # WebSocket server
 actix = "0.13"
 actix-web = { version = "4.11", default-features = false, features = ["macros"] }
-actix-ws = "0.3"
+actix-ws = "0.4"
 bytes = "1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["fs", "macros", "sync", "time"] }
