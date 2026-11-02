@@ -76,7 +76,8 @@ fn value(s: &Snapshot, kind: SensorKind, now: f64) -> Value {
             .into_owned()
             .into();
     }
-    let off = !s.connected || s.power == Power::Off;
+    // Values are kept while disconnected, like the media player attributes.
+    let off = s.power == Power::Off;
     match kind {
         SensorKind::VolumeControl => match s.volume_available {
             Some(true) => "on".into(),

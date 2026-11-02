@@ -136,8 +136,8 @@ pub fn attributes(s: &Snapshot, dirty: Dirty, now: f64, out: &mut Map<String, Va
     if dirty.any(Dirty::CONNECTION | Dirty::POWER | Dirty::PLAYBACK) {
         set(out, Attr::State, state(s).into());
     }
-    // Media attributes are empty while off.
-    let off = s.power == Power::Off || !s.connected;
+    // Media attributes are empty while off. They are kept while disconnected.
+    let off = s.power == Power::Off;
 
     if dirty.any(Dirty::VOLUME | Dirty::CONNECTION) {
         if let Some(v) = s.volume_percent() {

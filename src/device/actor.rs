@@ -46,6 +46,8 @@ const CONNECT_WAIT: Duration = Duration::from_secs(6);
 /// After wake-up, the Wi-Fi link of the Remote can go down for a short time during the connect.
 /// Lost packets then wait for the TCP resend (1 s or more). A connect step takes much less.
 const STALL_TIMEOUT: Duration = Duration::from_millis(500);
+/// Longest wait for the first now playing and volume state after a connect.
+const FIRST_STATE_WAIT: Duration = Duration::from_secs(1);
 /// Time between connects while the network is not ready, for example right after wake-up.
 const NETWORK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// Longest time to retry fast while the network is not ready. Then the normal delay is used.
@@ -465,7 +467,28 @@ impl AppleTvActor {
         self.tv = Some(tv);
         self.set_status(DeviceStatus::Connected);
         self.query_power(ctx);
-        dirty |= self.update_now_playing(ctx) | self.update_volume();
+        // Until the device sends its state, the channels hold empty values. Using them would clear
+        // what the Remote shows, so they are used only after the first update or after a wait.
+        if self
+            .np
+            .as_ref()
+            .is_some_and(|rx| rx.has_changed().unwrap_or(false))
+        {
+            dirty |= self.update_now_playing(ctx);
+        }
+        if self
+            .volume
+            .as_ref()
+            .is_some_and(|rx| rx.has_changed().unwrap_or(false))
+        {
+            dirty |= self.update_volume();
+        }
+        ctx.run_later(FIRST_STATE_WAIT, move |act, ctx| {
+            if act.generation == generation {
+                let dirty = act.update_now_playing(ctx) | act.update_volume();
+                act.emit(dirty);
+            }
+        });
         self.emit(dirty);
 
         self.poll(ctx);
@@ -1302,7 +1325,10 @@ impl Handler<Disconnect> for AppleTvActor {
     fn handle(&mut self, _: Disconnect, ctx: &mut Self::Context) {
         self.want = false;
         self.cancel_timers(ctx);
-        self.lost_connection(ctx);
+        // Asked for, for example at standby: the entities keep their state. Only a lost
+        // connection makes them unavailable.
+        self.close(ctx);
+        self.set_status(DeviceStatus::Disconnected);
     }
 }
 

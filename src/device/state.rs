@@ -396,23 +396,11 @@ impl Snapshot {
         Dirty::POWER
     }
 
-    /// Reset the state after a disconnect. Lists from the cache are kept.
-    pub fn disconnected(&mut self) -> Dirty {
-        let apps = std::mem::take(&mut self.apps);
-        let accounts = std::mem::take(&mut self.accounts);
-        let airplay_devices = std::mem::take(&mut self.airplay_devices);
-        let current_account = self.current_account.take();
-        *self = Self {
-            name: std::mem::take(&mut self.name),
-            global_volume: self.global_volume,
-            own_output_uid: self.own_output_uid.take(),
-            apps,
-            accounts,
-            airplay_devices,
-            current_account,
-            ..Self::default()
-        };
-        self.rebuild_output_combos();
+    /// Mark the state as disconnected. The rest is kept, so the Remote keeps showing the media
+    /// info until the device sends new values after the reconnect.
+    pub const fn disconnected(&mut self) -> Dirty {
+        self.connected = false;
+        self.mrp = false;
         Dirty::ALL
     }
 
