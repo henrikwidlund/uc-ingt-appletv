@@ -1,0 +1,54 @@
+name: Security audit
+on:
+  push:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/audit.yml'
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/audit.yml'
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  security_audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache cargo-bin
+        id: cache-dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin
+          key: ${{ runner.os }}-cargo-bin
+
+      - name: Install cargo audit
+        shell: bash
+        run: |
+          if [[ ! -x "$(command -v cargo-audit)" ]]; then
+            echo "cargo-audit not found, installing it with cargo"
+            cargo install --force cargo-audit
+          fi;
+
+      - name: Install cargo deny
+        shell: bash
+        run: |
+          if [[ ! -x "$(command -v cargo-deny)" ]]; then
+            echo "cargo-deny not found, installing it with cargo"
+            cargo install --force cargo-deny
+          fi;
+
+      - run: cargo audit
+      - run: cargo deny check

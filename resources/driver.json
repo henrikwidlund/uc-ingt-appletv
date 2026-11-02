@@ -1,0 +1,38 @@
+{
+  "driver_id": "appletv_rs",
+  "version": "",
+  "min_core_api": "0.20.0",
+  "name": {
+    "en": "Apple TV (Rust)"
+  },
+  "icon": "uc:integration",
+  "description": {
+    "en": "Control your Apple TV with Remote Two/3."
+  },
+  "developer": {
+    "name": "Henrik Widlund",
+    "url": "https://github.com/henrikwidlund/uc-intg-appletv"
+  },
+  "home_page": "https://github.com/henrikwidlund/uc-intg-appletv",
+  "setup_data_schema": {
+    "title": {
+      "en": "Integration setup"
+    },
+    "settings": [
+      {
+        "id": "info",
+        "label": {
+          "en": "Setup process"
+        },
+        "field": {
+          "label": {
+            "value": {
+              "en": "The integration finds Apple TV devices on the network.\n\n- Apple TV HD or Apple TV 4K is required.\n- The Apple TV must be on the same network as the Remote.\n- A PIN is shown on the TV during pairing.\n- Set AirPlay access on the Apple TV to \"Anyone on the Same Network\"."
+            }
+          }
+        }
+      }
+    ]
+  },
+  "release_date": "2026-10-31"
+}

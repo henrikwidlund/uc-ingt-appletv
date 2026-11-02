@@ -1,0 +1,95 @@
+[package]
+name = "uc-intg-appletv"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MPL-2.0"
+description = "Apple TV integration for Unfolded Circle Remote Two/3"
+authors = ["Henrik Widlund"]
+publish = false
+
+[features]
+default = ["mdns-sd"]
+# mDNS service publishing. The Remote needs it to find the driver.
+# Pure Rust, works on all platforms and in cross builds.
+mdns-sd = ["dep:mdns-sd"]
+
+[dependencies]
+uc_api = { git = "https://github.com/unfoldedcircle/api-model-rs", rev = "8853034", features = ["prost"] }
+ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "292240d785348b2b643d4a756c287b35e6225d2e", features = ["opus"] }
+
+# WebSocket server
+actix = "0.13"
+actix-web = { version = "4.11", default-features = false, features = ["macros"] }
+actix-ws = "0.3"
+bytes = "1"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["fs", "macros", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+prost = "0.14"
+
+# mDNS publishing
+hostname = "0.4"
+
+# JSON (de)serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+rust-fsm = "0.6"
+const_format = "0.2"
+strum = { version = "0.27", features = ["derive"] }
+thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+uuid = { version = "1", features = ["v4"] }
+
+# Logging. The `log` feature of tracing forwards ratv log events to env_logger.
+env_logger = "0.11"
+log = "0.4"
+mdns-sd = { version = "0.21.6", optional = true }
+
+[build-dependencies]
+built = { version = "0.8", features = ["chrono", "semver", "cargo-lock"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+non_ascii_idents = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_qualifications = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+exit = "warn"
+unwrap_used = "warn"
+# Conflicts with the `unreachable_pub` lint.
+redundant_pub_crate = "allow"
+# `mul_add` is slow on CPUs without FMA.
+suboptimal_flops = "allow"
+# Duplicates come from dependencies.
+multiple_crate_versions = "allow"
+# Reports guards that are already dropped at the end of their block.
+significant_drop_tightening = "allow"
+# Needs `repository` and other fields that are not set.
+cargo_common_metadata = "allow"
+# The driver runs on one thread (actix), so futures do not need to be `Send`.
+future_not_send = "allow"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+# Actix handlers take messages by value.
+needless_pass_by_value = "allow"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true
+panic = "abort"

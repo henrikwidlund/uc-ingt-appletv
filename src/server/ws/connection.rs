@@ -1,0 +1,391 @@
+// Copyright (c) 2022 Unfolded Circle ApS, Markus Zehnder <markus.z@unfoldedcircle.com>
+// Copyright (c) 2026 Henrik Widlund
+// SPDX-License-Identifier: MPL-2.0
+
+//! WebSocket connection handling for one Remote.
+
+use crate::controller::{
+    NewR2Session, R2AudioChunkMsg, R2SessionDisconnect, SendWsMessage, VOICE_SAMPLE_RATE,
+};
+use crate::errors::ServiceError;
+use crate::server::ws::WsConn;
+use actix::{Actor, ActorFutureExt, AsyncContext, Handler, WrapFuture};
+use actix_ws::{AggregatedMessage, CloseCode, CloseReason, Session};
+use bytes::Bytes;
+use log::{debug, error, info, warn};
+use prost::Message;
+use std::time::Instant;
+use uc_api::intg::proto::{
+    AudioFormat, IntegrationMessage, SampleFormat, integration_message::Message as ProtoMsg,
+};
+use uc_api::ws::{WsMessage, WsResultMsgData};
+
+/// Sends messages from the controller to the WebSocket connection.
+///
+/// Messages are sent one after another. Events have no id, so the Remote must get them in the
+/// order they were created. A send only puts the frame in the session queue, so this is fast.
+struct WsSender {
+    id: String,
+    session: Session,
+    msg_tracing_out: bool,
+}
+
+impl Actor for WsSender {
+    type Context = actix::Context<Self>;
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+        ctx.set_mailbox_capacity(64);
+    }
+}
+
+impl Handler<SendWsMessage> for WsSender {
+    type Result = ();
+
+    fn handle(&mut self, msg: SendWsMessage, ctx: &mut Self::Context) {
+        let id = self.id.clone();
+        let msg_tracing_out = self.msg_tracing_out;
+        let mut session = self.session.clone();
+
+        // `wait` blocks the mailbox until the message is sent: keeps the order.
+        ctx.wait(
+            async move {
+                let _ = WsConn::send(&id, msg_tracing_out, &msg.0, &mut session).await;
+            }
+            .into_actor(self)
+            .map(|(), _, _| ()),
+        );
+    }
+}
+
+impl WsConn {
+    /// Runs the message processing of the WebSocket connection until it is closed.
+    ///
+    /// - Registers the session with the controller.
+    /// - Sends ping frames and closes the connection if the client does not answer.
+    /// - Forwards requests, responses and events to the controller.
+    pub(crate) async fn run(
+        mut self,
+        mut session: Session,
+        mut stream: actix_ws::AggregatedMessageStream,
+    ) {
+        use actix_web::rt::time;
+        use futures::StreamExt;
+
+        // Only header-based authentication is used, so the authentication message is sent right away.
+        let _ = session
+            .text(r#"{"kind":"resp","req_id":0,"code":200,"msg":"authentication"}"#)
+            .await;
+
+        let sender = WsSender {
+            id: self.id.clone(),
+            session: session.clone(),
+            msg_tracing_out: self.msg_tracing_out,
+        }
+        .start();
+
+        if let Err(e) = self
+            .controller_addr
+            .send(NewR2Session {
+                addr: sender.recipient(),
+                id: self.id.clone(),
+            })
+            .await
+        {
+            error!("Error registering new WebSocket connection: {e}");
+            let _ = session
+                .close(Some(CloseReason {
+                    code: CloseCode::Error,
+                    description: Some("internal error".into()),
+                }))
+                .await;
+            return;
+        }
+
+        debug!("[{}] started", self.id);
+
+        let mut hb_interval = time::interval(self.heartbeat.interval);
+        loop {
+            tokio::select! {
+                _ = hb_interval.tick() => {
+                    if Instant::now().duration_since(self.hb) > self.heartbeat.timeout {
+                        info!("[{}] Closing connection due to failed heartbeat", self.id);
+                        let _ = session.close(Some(CloseReason {
+                            code: CloseCode::Away,
+                            description: Some("heartbeat timeout".into()),
+                        })).await;
+                        break;
+                    }
+                    let _ = session.ping(b"").await;
+                }
+                msg = stream.next() => {
+                    match msg {
+                        Some(Ok(msg)) => {
+                            if let Err(close_reason) = self.handle_stream_message(msg, &mut session).await {
+                                if close_reason.is_some() {
+                                    let _ = session.close(close_reason).await;
+                                }
+                                break;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            info!("[{}] Closing WebSocket: {e:?}", self.id);
+                            let _ = session.close(None).await;
+                            break;
+                        }
+                        None => {
+                            debug!("[{}] Message stream ended, closing connection", self.id);
+                            let _ = session.close(None).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.controller_addr.do_send(R2SessionDisconnect {
+            id: self.id.clone(),
+        });
+        debug!("[{}] stopped", self.id);
+    }
+
+    /// Process a received WebSocket message.
+    ///
+    /// Returns `Err` if the connection must be closed.
+    async fn handle_stream_message(
+        &mut self,
+        msg: AggregatedMessage,
+        session: &mut Session,
+    ) -> Result<(), Option<CloseReason>> {
+        self.hb = Instant::now();
+        match msg {
+            AggregatedMessage::Text(text) => {
+                if self.msg_tracing_in {
+                    debug!("[{}] -> {text}", self.id);
+                }
+                self.handle_text_message(&text, session).await
+            }
+            AggregatedMessage::Binary(data) => self.handle_binary_message(data).await,
+            AggregatedMessage::Ping(bytes) => {
+                let _ = session.pong(&bytes).await;
+                Ok(())
+            }
+            AggregatedMessage::Pong(_) => Ok(()),
+            AggregatedMessage::Close(reason) => {
+                info!("[{}] Remote closed connection. Reason: {reason:?}", self.id);
+                Err(None)
+            }
+        }
+    }
+
+    async fn handle_text_message(
+        &self,
+        text: &str,
+        session: &mut Session,
+    ) -> Result<(), Option<CloseReason>> {
+        match serde_json::from_str::<WsMessage>(text) {
+            Ok(msg) => self.process_intg_api_message(msg, session).await,
+            Err(e) => {
+                warn!("[{}] Invalid JSON message: {e}", self.id);
+                Err(Some(CloseReason {
+                    code: CloseCode::Unsupported,
+                    description: Some("Invalid JSON message".into()),
+                }))
+            }
+        }
+    }
+
+    /// Process a received Integration-API request, response or event message.
+    async fn process_intg_api_message(
+        &self,
+        msg: WsMessage,
+        session: &mut Session,
+    ) -> Result<(), Option<CloseReason>> {
+        let req_id = msg.id.unwrap_or_default();
+
+        match msg.kind.as_deref() {
+            Some("req") => {
+                let req_msg = msg.msg.clone().unwrap_or_default();
+                match Self::on_request(&self.id, msg, self.controller_addr.clone()).await {
+                    Ok(Some(response)) => {
+                        Self::send(&self.id, self.msg_tracing_out, &response, session).await
+                    }
+                    Ok(None) => Ok(()),
+                    Err(e) => {
+                        warn!(
+                            "[{}] Error processing received message '{req_msg}': {e}",
+                            self.id
+                        );
+                        self.send_error_response(req_id, e, session).await
+                    }
+                }
+            }
+            Some("resp") => {
+                if let Err(e) = Self::on_response(&self.id, msg, &self.controller_addr) {
+                    warn!("[{}] Error processing response: {e}", self.id);
+                }
+                Ok(())
+            }
+            Some("event") => {
+                if let Err(e) = Self::on_event(&self.id, msg, &self.controller_addr) {
+                    warn!("[{}] Error processing event: {e}", self.id);
+                }
+                Ok(())
+            }
+            Some(other) => {
+                warn!("[{}] Unsupported message kind: {other}", self.id);
+                self.send_error_response(
+                    req_id,
+                    ServiceError::BadRequest(format!("Unsupported message kind: {other}")),
+                    session,
+                )
+                .await
+            }
+            None => {
+                self.send_error_response(
+                    req_id,
+                    ServiceError::BadRequest("Missing property: kind".into()),
+                    session,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Handle a binary protobuf message. Only voice audio is supported.
+    async fn handle_binary_message(&self, data: Bytes) -> Result<(), Option<CloseReason>> {
+        let msg = IntegrationMessage::decode(data).map_err(|e| {
+            error!("[{}] Invalid binary message: {e:?}", self.id);
+            None
+        })?;
+        let msg = msg.message.ok_or_else(|| {
+            error!("[{}] Unable to decode binary message", self.id);
+            None
+        })?;
+
+        match msg {
+            ProtoMsg::VoiceBegin(begin) => {
+                if let Some(cfg) = begin.configuration {
+                    info!(
+                        "[{}] => voice_begin({}): {cfg:?}",
+                        self.id, begin.session_id
+                    );
+                    // Siri needs 16 kHz mono signed 16 bit PCM. Any other format is rejected.
+                    if cfg.format != AudioFormat::Pcm as i32
+                        || cfg.sample_format != SampleFormat::I16 as i32
+                        || cfg.sample_rate != VOICE_SAMPLE_RATE
+                        || cfg.channels != 1
+                    {
+                        self.controller_addr
+                            .do_send(R2AudioChunkMsg::end(begin.session_id));
+                        error!(
+                            "[{}] Invalid audio format, closing connection: {cfg:?}",
+                            self.id
+                        );
+                        return Err(Some(CloseReason {
+                            code: CloseCode::Unsupported,
+                            description: Some("Invalid audio format".into()),
+                        }));
+                    }
+                } else {
+                    warn!(
+                        "[{}] => voice_begin({}) without audio format, assuming requested format",
+                        self.id, begin.session_id
+                    );
+                }
+                Ok(())
+            }
+            ProtoMsg::VoiceData(data) => {
+                match self
+                    .controller_addr
+                    .send(R2AudioChunkMsg {
+                        session_id: data.session_id,
+                        data: data.samples,
+                    })
+                    .await
+                {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => {
+                        warn!("[{}] Error processing audio chunk: {e}", self.id);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let msg = format!("Internal error sending audio chunk: {e}");
+                        error!("[{}] {msg}", self.id);
+                        Err(Some(CloseReason {
+                            code: CloseCode::Error,
+                            description: Some(msg),
+                        }))
+                    }
+                }
+            }
+            ProtoMsg::VoiceEnd(end) => {
+                info!("[{}] => voice_end({})", self.id, end.session_id);
+                self.controller_addr
+                    .do_send(R2AudioChunkMsg::end(end.session_id));
+                Ok(())
+            }
+        }
+    }
+
+    async fn send_error_response(
+        &self,
+        req_id: u32,
+        error: ServiceError,
+        session: &mut Session,
+    ) -> Result<(), Option<CloseReason>> {
+        let response = service_error_to_ws_message(&self.id, req_id, error);
+        Self::send(&self.id, self.msg_tracing_out, &response, session).await
+    }
+
+    /// Send a message to the WebSocket session. Returns `Err` if the session is closed.
+    async fn send(
+        id: &str,
+        msg_tracing_out: bool,
+        msg: &WsMessage,
+        session: &mut Session,
+    ) -> Result<(), Option<CloseReason>> {
+        match serde_json::to_string(msg) {
+            Ok(text) => {
+                if msg_tracing_out {
+                    debug!("[{id}] <- {text}");
+                }
+                session.text(text).await.map_err(|e| {
+                    error!("[{id}] WebSocket send error: {e}");
+                    None
+                })
+            }
+            Err(e) => {
+                error!("[{id}] Error serializing outgoing message: {e}");
+                Ok(())
+            }
+        }
+    }
+}
+
+fn service_error_to_ws_message(id: &str, req_id: u32, error: ServiceError) -> WsMessage {
+    debug!("[{id}] Sending error response for: {error:?}");
+
+    let (code, ws_err) = match error {
+        ServiceError::InternalServerError(_) => {
+            (500, WsResultMsgData::new("ERROR", "Internal server error"))
+        }
+        ServiceError::SerializationError(e) | ServiceError::BadRequest(e) => {
+            (400, WsResultMsgData::new("BAD_REQUEST", e))
+        }
+        ServiceError::NotConnected => (
+            503,
+            WsResultMsgData::new("SERVICE_UNAVAILABLE", "Apple TV is not connected"),
+        ),
+        ServiceError::ServiceUnavailable(e) => {
+            (503, WsResultMsgData::new("SERVICE_UNAVAILABLE", e))
+        }
+        ServiceError::Timeout => (
+            408,
+            WsResultMsgData::new("TIMEOUT", "Apple TV did not answer"),
+        ),
+        ServiceError::NotFound(e) => (404, WsResultMsgData::new("NOT_FOUND", e)),
+        ServiceError::NotSupported(e) => (501, WsResultMsgData::new("NOT_IMPLEMENTED", e)),
+    };
+
+    WsMessage::error(req_id, code, ws_err)
+}

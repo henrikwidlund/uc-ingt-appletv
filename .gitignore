@@ -1,0 +1,9 @@
+/target
+/test-config
+/manual-test-results-*.md
+/.manual-test-setup
+/.config-backup-*/
+/config.json.before-link-test
+/config.json
+/cache_*.json
+/driver.log

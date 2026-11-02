@@ -1,0 +1,42 @@
+// Copyright (c) 2022 Unfolded Circle ApS, Markus Zehnder <markus.z@unfoldedcircle.com>
+// Copyright (c) 2026 Henrik Widlund
+// SPDX-License-Identifier: MPL-2.0
+
+//! Common utility functions.
+
+use serde::de::{DeserializeOwned, Error};
+use serde_json::Value;
+use std::env;
+use std::ffi::OsStr;
+
+/// Read a boolean from an environment variable. `true` and `1` are true.
+///
+/// Returns `false` if the variable is not set or has another value.
+pub fn bool_from_env<K: AsRef<OsStr>>(key: K) -> bool {
+    env::var(key).is_ok_and(|v| v == "true" || v == "1")
+}
+
+/// Deserialize the `msg_data` JSON value of a message into a typed struct.
+pub trait DeserializeMsgData: Into<Option<Value>> {
+    fn deserialize<T: DeserializeOwned>(self) -> Result<T, serde_json::Error> {
+        self.into().map_or_else(
+            || Err(serde_json::Error::custom("Missing field: 'msg_data'")),
+            T::deserialize,
+        )
+    }
+}
+
+macro_rules! return_fut_ok {
+    ($result:expr) => {
+        return Box::pin(actix::fut::result(Ok($result)))
+    };
+}
+
+macro_rules! return_fut_err {
+    ($result:expr) => {
+        return Box::pin(actix::fut::result(Err($result)))
+    };
+}
+
+pub(crate) use return_fut_err;
+pub(crate) use return_fut_ok;

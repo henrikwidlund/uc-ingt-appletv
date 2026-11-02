@@ -1,0 +1,133 @@
+# Build the driver for the Remote and package it as a custom integration.
+name: Build & Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags:
+      - v[0-9]+.[0-9]+.[0-9]+*
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+# Prevent concurrent runs of this workflow for open pull requests.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  APP_NAME: uc-intg-appletv
+  ARTIFACT_PREFIX: uc-intg-appletv-rs
+  HASH_FILENAME: uc-intg-appletv-rs.hash
+  TARGET: aarch64-unknown-linux-gnu
+  TARGET_ID: aarch64_unknown_linux_gnu
+  TARGET_TRIPLE: aarch64-none-linux-gnu
+  SDK_URL: https://github.com/unfoldedcircle/ucr2-toolchain/releases/download/v1.0.1/ucr2-aarch64-toolchain-1.0.1-noqt.tar.gz
+  SDK_NAME: aarch64-buildroot-linux-gnu_sdk-buildroot
+  SYSROOT_NAME: aarch64-buildroot-linux-gnu
+  # Must match the linker in .cargo/config.toml.
+  LINKER: ucr2-aarch64-none-linux-gnu-gcc
+
+jobs:
+  build:
+    name: Remote build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # History of 200 should be more than enough to calculate commit count since last release tag.
+          fetch-depth: 200
+          persist-credentials: false
+
+      - name: Fetch all tags to determine version
+        run: |
+          git fetch origin +refs/tags/*:refs/tags/*
+          VERSION=$(git describe --match "v[0-9]*" --tags HEAD --always)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "ARTIFACT_NAME=${{ env.ARTIFACT_PREFIX }}-$VERSION-aarch64" >> $GITHUB_ENV
+
+      - name: Install Rust
+        run: rustup update stable && rustup default stable && rustup target add ${{ env.TARGET }}
+
+      - name: Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ env.TARGET }}
+
+      - name: Install the Remote toolchain
+        run: |
+          wget -qO- ${{ env.SDK_URL }} | tar -xz
+          ./${{ env.SDK_NAME }}/relocate-sdk.sh
+          # Remove a symlink that breaks the cargo build. If /usr becomes a real directory, rm fails
+          # and shows that the SDK changed.
+          rm ./${{ env.SDK_NAME }}/usr
+
+      - name: Configure the linker
+        run: |
+          mkdir -p ~/.cargo/bin/
+          cat >~/.cargo/bin/${{ env.LINKER }} <<EOL
+          #!/bin/bash
+          \$GITHUB_WORKSPACE/${{ env.SDK_NAME }}/bin/${{ env.TARGET_TRIPLE }}-gcc --sysroot=\$GITHUB_WORKSPACE/${{ env.SDK_NAME }}/${{ env.SYSROOT_NAME }}/sysroot "\$@"
+          EOL
+          chmod +x ~/.cargo/bin/${{ env.LINKER }}
+          ${{ env.LINKER }} --version
+
+      - name: Build
+        run: |
+          export SDK=$GITHUB_WORKSPACE/${{ env.SDK_NAME }}
+          export CC_${{ env.TARGET_ID }}=$SDK/bin/${{ env.TARGET_TRIPLE }}-gcc
+          export CXX_${{ env.TARGET_ID }}=$SDK/bin/${{ env.TARGET_TRIPLE }}-g++
+          export AR_${{ env.TARGET_ID }}=$SDK/bin/${{ env.TARGET_TRIPLE }}-ar
+          cargo build --locked --release --target=${{ env.TARGET }}
+
+      - name: Package
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/artifacts/bin
+          cp target/${{ env.TARGET }}/release/${{ env.APP_NAME }} $GITHUB_WORKSPACE/artifacts/bin/driver
+          # The Remote reads the version and date from the packaged driver.json.
+          jq --arg version "${VERSION#v}" --arg date "$(date -u +%Y-%m-%d)" \
+            '.version = $version | .release_date = $date' \
+            resources/driver.json > $GITHUB_WORKSPACE/artifacts/driver.json
+          cp LICENSE $GITHUB_WORKSPACE/artifacts/
+          echo "$VERSION" > $GITHUB_WORKSPACE/artifacts/version.txt
+          tar czvf $GITHUB_WORKSPACE/${{ env.ARTIFACT_NAME }}.tar.gz -C $GITHUB_WORKSPACE/artifacts .
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_NAME }}.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    name: GitHub release
+    if: contains(github.ref, 'tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+
+      - name: Create hashes
+        run: |
+          # Artifacts are extracted into one directory each.
+          for D in *; do if [ -d "$D" ]; then mv "$D"/* ./; fi; done
+          for filename in *.tar.gz; do echo "sha256  $(sha256sum $filename)" >> ${{ env.HASH_FILENAME }}; done
+          ls -lah
+
+      - name: Create release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            *.tar.gz
+            ${{ env.HASH_FILENAME }}
