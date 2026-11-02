@@ -52,7 +52,7 @@ impl WsConn {
 }
 
 /// HTTP endpoint for the WebSocket upgrade.
-#[get("/ws")]
+#[get("/")]
 pub async fn ws_index(
     request: HttpRequest,
     stream: web::Payload,
