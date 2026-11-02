@@ -19,10 +19,31 @@ The driver id is `appletv_rs`, so it can run next to the Apple TV integration th
 
 One pairing with one PIN covers all features.
 
+## Compared to the built-in Apple TV integration
+
+- One PIN for the pairing instead of two.
+- Siri with the voice button.
+- Repeat, shuffle, audio track, subtitles, browse and play media on the media player.
+- Mute and unmute as separate commands. The built-in integration has only mute toggle.
+- More selects and sensors. The built-in integration has only the app and the audio output.
+- Updates come only when the Apple TV sends them. There is no poll every 10 seconds.
+- Entities keep their state while the Remote sleeps. They do not show as unavailable when it wakes up.
+
+## Network and wake-up
+
+- With an IP address in the setup, the driver asks that address directly. This also works when the
+  Apple TV is in another network (VLAN) and only mDNS is forwarded between the networks.
+- If the Apple TV gets a new IP address, the driver finds it on the network and saves the new address.
+- After the Remote wakes up, the driver connects to the last address first. While the network of the
+  Remote starts, it tries again every 50 ms for up to 3 seconds. A connect step without an answer in
+  0.5 seconds is started again once.
+- A command that comes while the driver connects waits for the connection. It does not fail.
+- If 3 commands time out within 60 seconds, the driver connects again.
+
 ## Requirements
 
 - Apple TV HD (4th generation) or Apple TV 4K (all generations). Older models are not shown in the setup.
-  Tested with an Apple TV 4K (1st generation) on tvOS 26.
+  Tested with an Apple TV 4K (1st generation) on tvOS 26.6.1.
 - The Apple TV and the Remote are on the same network or use a mDNS reflector. Multicast DNS (mDNS) must not be blocked.
 - On the Apple TV, in the AirPlay settings: set _Allow Access_ to _Anyone on the Same Network_.
 - A fixed IP address for the Apple TV (DHCP reservation) is recommended. The driver then finds the Apple TV
@@ -37,6 +58,11 @@ One pairing with one PIN covers all features.
 - The Apple TV does not report the current account. The account select shows the last account chosen
   through the driver.
 - Metadata, artwork and playback speeds depend on the app. Many apps send only some of them.
+  For example, the Apple TV app sends genre and content rating, and season and episode for shows.
+  The Music app sends the genre.
+- The playback speed select is empty when the app does not report speeds.
+- Fast-forward and rewind depend on the app. In Disney+ they skip forward and back instead.
+  HBO Max and Netflix do not support them. Skip works in all three.
 
 ## Install on the Remote
 
