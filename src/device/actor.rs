@@ -23,6 +23,7 @@ use ratv::mrp::{NowPlaying, PlaybackState, Volume};
 use ratv::{AppleTv, ClientOptions, Endpoints};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +41,18 @@ const FULL_RECONNECT_INTERVAL: Duration = Duration::from_secs(600);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Longest wait for a running connect before a command runs. The core waits 10 s for the answer.
 const CONNECT_WAIT: Duration = Duration::from_secs(6);
+/// A connect step without answer in this time is started again once.
+///
+/// After wake-up, the Wi-Fi link of the Remote can go down for a short time during the connect.
+/// Lost packets then wait for the TCP resend (1 s or more). A connect step takes much less.
+const STALL_TIMEOUT: Duration = Duration::from_millis(500);
+/// Time between connects while the network is not ready, for example right after wake-up.
+const NETWORK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+/// Longest time to retry fast while the network is not ready. Then the normal delay is used.
+const NETWORK_RETRY_TIMEOUT: Duration = Duration::from_secs(3);
+/// Command timeouts in [`COMMAND_TIMEOUT_WINDOW`] after which the connection is made again.
+const MAX_COMMAND_TIMEOUTS: usize = 3;
+const COMMAND_TIMEOUT_WINDOW: Duration = Duration::from_secs(60);
 /// A connection that stayed up this long resets the reconnect delay.
 const STABLE_CONNECTION: Duration = Duration::from_secs(60);
 /// Siri ends if no audio arrives in this time.
@@ -147,6 +160,10 @@ pub struct AppleTvActor {
     /// Mute and power set by the last commands. Used for toggles until the device reports them.
     expected_mute: Option<bool>,
     expected_power: Option<Power>,
+    /// End of the fast retries while the network is not ready.
+    network_retry_end: Option<Instant>,
+    /// Times of the last command timeouts.
+    command_timeouts: VecDeque<Instant>,
 }
 
 impl AppleTvActor {
@@ -197,6 +214,8 @@ impl AppleTvActor {
             endpoints: None,
             expected_mute: None,
             expected_power: None,
+            network_retry_end: None,
+            command_timeouts: VecDeque::with_capacity(MAX_COMMAND_TIMEOUTS),
             cmd_lock: Arc::default(),
             timers: Timers::default(),
             apps_fetched: None,
@@ -288,14 +307,19 @@ impl AppleTvActor {
         let version = self.cfg_version;
         let mut options = ClientOptions::default();
         options.name.clone_from(&self.ctx.client_name);
+        options.stall_timeout = Some(STALL_TIMEOUT);
 
         let known = self.endpoints;
+        let start = Instant::now();
 
         let fut = async move {
             if let Some(ep) = known {
                 match AppleTv::connect(&ep, &cfg.credentials, &options).await {
-                    Ok(tv) => return (None, Ok((tv, ep))),
-                    Err(e) if e.is_auth() => return (None, Err(Some(e))),
+                    Ok(tv) => return (None, Ok((tv, ep, "last address"))),
+                    // A scan fails the same way.
+                    Err(e) if e.is_auth() || network_not_ready(&e) => {
+                        return (None, Err(Some(e)));
+                    }
                     Err(e) => debug!("[{}] last endpoints failed, scanning: {e}", cfg.name),
                 }
             }
@@ -309,7 +333,7 @@ impl AppleTvActor {
             let result = AppleTv::connect(&ep, &cfg.credentials, &options).await;
             (
                 changed.then_some(cfg),
-                result.map(|tv| (tv, ep)).map_err(Some),
+                result.map(|tv| (tv, ep, "scan")).map_err(Some),
             )
         };
         ctx.spawn(fut.into_actor(self).map(move |(cfg, result), act, ctx| {
@@ -328,7 +352,7 @@ impl AppleTvActor {
                     "[{}] result of an old connect attempt ignored",
                     act.cfg.name
                 );
-                if let Ok((tv, _)) = result {
+                if let Ok((tv, ..)) = result {
                     actix::spawn(async move {
                         let _ = tv.close().await;
                     });
@@ -336,13 +360,13 @@ impl AppleTvActor {
                 return;
             }
             match result {
-                Ok((tv, ep)) if act.want && act.status == DeviceStatus::Connecting => {
+                Ok((tv, ep, via)) if act.want && act.status == DeviceStatus::Connecting => {
                     if act.cfg_version == version {
                         act.endpoints = Some(ep);
                     }
-                    act.on_connected(tv, ctx);
+                    act.on_connected(tv, via, start, ctx);
                 }
-                Ok((tv, _)) => {
+                Ok((tv, ..)) => {
                     actix::spawn(async move {
                         let _ = tv.close().await;
                     });
@@ -356,6 +380,9 @@ impl AppleTvActor {
                     act.lost_connection(ctx);
                     act.set_status(DeviceStatus::AuthError);
                 }
+                Err(Some(e)) if network_not_ready(&e) && act.network_retry(ctx) => {
+                    debug!("[{}] network not ready: {e}", act.cfg.name);
+                }
                 Err(e) => {
                     match e {
                         Some(e) => warn!("[{}] connect failed: {e}", act.cfg.name),
@@ -368,11 +395,19 @@ impl AppleTvActor {
         }));
     }
 
-    fn on_connected(&mut self, tv: AppleTv, ctx: &mut Context<Self>) {
+    /// `via` tells how the address was found, `start` is the start of the connect.
+    fn on_connected(&mut self, tv: AppleTv, via: &str, start: Instant, ctx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
-        self.connected_at = Some(Instant::now());
-        info!("[{}] connected", self.cfg.name);
+        let now = Instant::now();
+        info!(
+            "[{}] connected in {} ms ({via})",
+            self.cfg.name,
+            (now - start).as_millis()
+        );
+        self.connected_at = Some(now);
+        self.network_retry_end = None;
+        self.command_timeouts.clear();
 
         let missing = match (tv.companion().is_some(), tv.mrp().is_some()) {
             (true, true) => None,
@@ -509,6 +544,68 @@ impl AppleTvActor {
             act.timers.reconnect = None;
             act.connect(ctx);
         }));
+    }
+
+    /// Connect again soon while the network is not ready. Returns `false` when the time for this is over.
+    fn network_retry(&mut self, ctx: &mut Context<Self>) -> bool {
+        let now = Instant::now();
+        let end = *self
+            .network_retry_end
+            .get_or_insert(now + NETWORK_RETRY_TIMEOUT);
+        if now >= end {
+            warn!("[{}] network not ready", self.cfg.name);
+            return false;
+        }
+        self.status = DeviceStatus::Disconnected;
+        self.timers.reconnect = Some(ctx.run_later(NETWORK_RETRY_INTERVAL, |act, ctx| {
+            act.timers.reconnect = None;
+            act.connect(ctx);
+        }));
+        true
+    }
+
+    /// Connect again if too many commands timed out in a short time.
+    ///
+    /// The connection can look open while one protocol does not answer.
+    /// Commands that work do not reset the count, because they can use the other protocol.
+    fn command_timed_out(&mut self, ctx: &mut Context<Self>) {
+        let now = Instant::now();
+        if self.command_timeouts.len() == MAX_COMMAND_TIMEOUTS {
+            self.command_timeouts.pop_front();
+        }
+        self.command_timeouts.push_back(now);
+        if self.command_timeouts.len() < MAX_COMMAND_TIMEOUTS
+            || self
+                .command_timeouts
+                .front()
+                .is_some_and(|t| now - *t > COMMAND_TIMEOUT_WINDOW)
+        {
+            return;
+        }
+        warn!(
+            "[{}] {MAX_COMMAND_TIMEOUTS} command timeouts in {} s, reconnecting",
+            self.cfg.name,
+            COMMAND_TIMEOUT_WINDOW.as_secs()
+        );
+        self.command_timeouts.clear();
+        self.lost_connection(ctx);
+        self.connect(ctx);
+    }
+
+    /// Start a connect if none runs. A failed pairing is tried again.
+    fn start_connect(&mut self, ctx: &mut Context<Self>) {
+        self.want = true;
+        if self.status == DeviceStatus::AuthError {
+            self.set_status(DeviceStatus::Disconnected);
+        }
+        if self.status == DeviceStatus::Disconnected {
+            if let Some(handle) = self.timers.reconnect.take() {
+                ctx.cancel_future(handle);
+            }
+            self.attempts = 0;
+            self.network_retry_end = None;
+            self.connect(ctx);
+        }
     }
 
     /// Reconnect all protocols. Skipped while Siri or a fast forward or rewind is active.
@@ -1195,17 +1292,7 @@ impl Handler<Connect> for AppleTvActor {
     type Result = ();
 
     fn handle(&mut self, _: Connect, ctx: &mut Self::Context) {
-        self.want = true;
-        if self.status == DeviceStatus::AuthError {
-            self.set_status(DeviceStatus::Disconnected);
-        }
-        if self.status == DeviceStatus::Disconnected {
-            if let Some(handle) = self.timers.reconnect.take() {
-                ctx.cancel_future(handle);
-            }
-            self.attempts = 0;
-            self.connect(ctx);
-        }
+        self.start_connect(ctx);
     }
 }
 
@@ -1260,6 +1347,11 @@ impl Handler<Command> for AppleTvActor {
                 _ => Err(ServiceError::NotSupported(msg.cmd_id)),
             };
             return Box::pin(fut::ready(result));
+        }
+        // The core can send a command before `exit_standby`.
+        if self.tv.is_none() && self.status == DeviceStatus::Disconnected {
+            debug!("[{}] command while disconnected, connecting", self.cfg.name);
+            self.start_connect(ctx);
         }
         // A command can come right after the Remote wakes up, while the connect still runs.
         let connecting = self.running_connect();
@@ -1320,8 +1412,15 @@ impl AppleTvActor {
             };
             (result, guard)
         };
-        fut.into_actor(self).map(move |(result, _guard), act, _| {
+        let cmd_id = msg.cmd_id.clone();
+        fut.into_actor(self).map(move |(result, _guard), act, ctx| {
             let ok = result.is_ok();
+            if let Err(e) = &result {
+                warn!("[{}] {cmd_id} failed: {e}", act.cfg.name);
+            }
+            if act.generation == generation && matches!(result, Err(ServiceError::Timeout)) {
+                act.command_timed_out(ctx);
+            }
             if act.generation == generation {
                 // After an error the device state is not known.
                 if begins_seek && !ok {
@@ -1388,9 +1487,36 @@ impl Handler<AudioChunk> for AppleTvActor {
     }
 }
 
+/// Returns `true` for errors that come while the network of the Remote starts, for example after wake-up.
+fn network_not_ready(e: &ratv::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        e,
+        ratv::Error::Io(io) if matches!(
+            io.kind(),
+            ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable | ErrorKind::NetworkDown
+        )
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_errors() {
+        use std::io::{Error, ErrorKind};
+        assert!(network_not_ready(
+            &Error::from(ErrorKind::NetworkUnreachable).into()
+        ));
+        assert!(network_not_ready(
+            &Error::from(ErrorKind::HostUnreachable).into()
+        ));
+        assert!(!network_not_ready(
+            &Error::from(ErrorKind::ConnectionRefused).into()
+        ));
+        assert!(!network_not_ready(&ratv::Error::Timeout));
+    }
 
     #[test]
     fn chapter_delay_is_valid() {
