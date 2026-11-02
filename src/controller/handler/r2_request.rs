@@ -5,7 +5,7 @@
 //! Handler for [`R2RequestMsg`].
 
 use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
-use crate::controller::{Controller, OperationModeInput, R2RequestMsg};
+use crate::controller::{Controller, R2RequestMsg, operation_mode};
 use crate::errors::ServiceError;
 use crate::util::{DeserializeMsgData, return_fut_err, return_fut_ok};
 use crate::{APP_VERSION, built_info};
@@ -100,7 +100,7 @@ impl Handler<R2RequestMsg> for Controller {
 
         // The other requests need the running mode.
         if self
-            .sm_consume(&msg.ws_id, &OperationModeInput::R2Request, ctx)
+            .sm_consume(&msg.ws_id, &operation_mode::Input::R2Request, ctx)
             .is_err()
         {
             return_fut_err!(ServiceError::ServiceUnavailable(

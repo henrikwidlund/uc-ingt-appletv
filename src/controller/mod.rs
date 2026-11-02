@@ -20,7 +20,7 @@ use crate::server::ArtworkStore;
 use actix::prelude::{Actor, Context, Recipient};
 use actix::{AsyncContext, SpawnHandle};
 use log::{debug, error, info, warn};
-use rust_fsm::{StateMachine, state_machine};
+use rust_fsm::state_machine;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -31,8 +31,8 @@ use uc_api::intg::{DeviceState, IntegrationDriverUpdate};
 use uc_api::ws::{EventCategory, WsMessage};
 
 state_machine! {
-    derive(Debug)
-    pub OperationMode(RequireSetup)
+    #[derive(Debug)]
+    pub operation_mode(RequireSetup)
 
     RequireSetup => {
         ConfigurationAvailable => Running,
@@ -98,7 +98,7 @@ pub struct Controller {
     device_state: DeviceState,
     drv_metadata: IntegrationDriverUpdate,
     /// State machine for the driver state: setup flow or running.
-    machine: StateMachine<OperationMode>,
+    machine: operation_mode::StateMachine,
     /// Driver setup timeout handle.
     setup_timeout: Option<SpawnHandle>,
     /// State of the active setup flow.
@@ -136,7 +136,7 @@ impl Controller {
             sessions: HashMap::default(),
             device_state: DeviceState::Connected,
             drv_metadata,
-            machine: StateMachine::new(),
+            machine: operation_mode::StateMachine::new(),
             setup_timeout: None,
             setup: None,
             store,
@@ -177,7 +177,7 @@ impl Controller {
     fn sm_consume(
         &mut self,
         ws_id: &str,
-        input: &OperationModeInput,
+        input: &operation_mode::Input,
         ctx: &mut Context<Self>,
     ) -> Result<(), ServiceError> {
         let old_state = format!("{:?}", self.machine.state());
@@ -188,7 +188,7 @@ impl Controller {
                     info!("State machine transition: {old_state} -> {state}");
                 }
                 match output {
-                    Some(OperationModeOutput::SetupFlowTimer) => {
+                    Some(operation_mode::Output::SetupFlowTimer) => {
                         if let Some(handle) = self.setup_timeout.take() {
                             ctx.cancel_future(handle);
                         }
@@ -203,7 +203,7 @@ impl Controller {
                             ));
                         }
                     }
-                    Some(OperationModeOutput::CancelSetupFlowTimer) => {
+                    Some(operation_mode::Output::CancelSetupFlowTimer) => {
                         if let Some(handle) = self.setup_timeout.take() {
                             ctx.cancel_future(handle);
                         }
@@ -245,7 +245,7 @@ impl Actor for Controller {
         let devices = self.store.load_devices();
         info!("{} configured Apple TV devices", devices.len());
         if !devices.is_empty() {
-            let _ = self.sm_consume("", &OperationModeInput::ConfigurationAvailable, ctx);
+            let _ = self.sm_consume("", &operation_mode::Input::ConfigurationAvailable, ctx);
         }
         for cfg in devices {
             self.add_device(cfg, ctx);

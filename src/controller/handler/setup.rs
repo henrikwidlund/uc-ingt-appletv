@@ -6,7 +6,7 @@
 
 use crate::config_store::{DeviceConfig, device_key};
 use crate::controller::handler::AbortDriverSetup;
-use crate::controller::{Controller, OperationModeInput, OperationModeState};
+use crate::controller::{Controller, operation_mode};
 use crate::device::{UpdateConfig, discovery};
 use crate::entities::EntityKind;
 use crate::errors::ServiceError;
@@ -95,7 +95,7 @@ impl Handler<SetupDriverMsg> for Controller {
     fn handle(&mut self, msg: SetupDriverMsg, ctx: &mut Self::Context) -> Self::Result {
         debug!("[{}] {:?}", msg.ws_id, msg.data);
         if self
-            .sm_consume(&msg.ws_id, &OperationModeInput::SetupDriverRequest, ctx)
+            .sm_consume(&msg.ws_id, &operation_mode::Input::SetupDriverRequest, ctx)
             .is_err()
         {
             return Err(ServiceError::BadRequest(
@@ -129,7 +129,7 @@ impl Handler<SetDriverUserDataMsg> for Controller {
     fn handle(&mut self, msg: SetDriverUserDataMsg, ctx: &mut Self::Context) -> Self::Result {
         debug!("[{}] setup user data", msg.ws_id);
         if self
-            .sm_consume(&msg.ws_id, &OperationModeInput::SetupUserData, ctx)
+            .sm_consume(&msg.ws_id, &operation_mode::Input::SetupUserData, ctx)
             .is_err()
         {
             return Err(ServiceError::BadRequest(
@@ -214,7 +214,7 @@ impl Handler<AbortDriverSetup> for Controller {
             return;
         }
         if self
-            .sm_consume(&msg.ws_id, &OperationModeInput::AbortSetup, ctx)
+            .sm_consume(&msg.ws_id, &operation_mode::Input::AbortSetup, ctx)
             .is_err()
         {
             return;
@@ -224,7 +224,11 @@ impl Handler<AbortDriverSetup> for Controller {
             session.reconfiguring = None;
         }
         if !self.devices.is_empty() {
-            let _ = self.sm_consume(&msg.ws_id, &OperationModeInput::ConfigurationAvailable, ctx);
+            let _ = self.sm_consume(
+                &msg.ws_id,
+                &operation_mode::Input::ConfigurationAvailable,
+                ctx,
+            );
             self.connect_devices();
         }
     }
@@ -555,7 +559,7 @@ impl Controller {
     /// Show a setup page.
     fn request_input(&mut self, ws_id: &str, page: Value, ctx: &mut Context<Self>) {
         if self
-            .sm_consume(ws_id, &OperationModeInput::RequestUserInput, ctx)
+            .sm_consume(ws_id, &operation_mode::Input::RequestUserInput, ctx)
             .is_err()
         {
             return;
@@ -580,9 +584,9 @@ impl Controller {
     ) {
         self.setup = None;
         let input = if error.is_none() {
-            OperationModeInput::Successful
+            operation_mode::Input::Successful
         } else {
-            OperationModeInput::SetupError
+            operation_mode::Input::SetupError
         };
         if self.sm_consume(ws_id, &input, ctx).is_err() {
             return;
@@ -590,7 +594,7 @@ impl Controller {
         if let Some(session) = self.sessions.get_mut(ws_id) {
             session.reconfiguring = None;
         }
-        if matches!(self.machine.state(), OperationModeState::Running) {
+        if matches!(self.machine.state(), operation_mode::State::Running) {
             self.connect_devices();
         }
         let state = if error.is_none() {
