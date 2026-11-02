@@ -49,7 +49,9 @@ if [[ "$mode" = "2" ]]; then
     read -r -p "Log file from 'Save console output to file', Enter = no file: " LOG
 else
     IDE=0
-    CONFIG_DIR="${UC_CONFIG_HOME:-$PWD/test-config}"
+    # Same default as the driver in RustRover, so both find the same pairing.
+    read -r -p "Config folder of the driver (UC_CONFIG_HOME), Enter = ${UC_CONFIG_HOME:-$PWD}: " CONFIG_DIR
+    CONFIG_DIR="${CONFIG_DIR:-${UC_CONFIG_HOME:-$PWD}}"
     LOG="$CONFIG_DIR/driver.log"
     mkdir -p "$CONFIG_DIR"
     touch "$LOG"
@@ -507,10 +509,11 @@ play an item from Up Next, and launch an app from Apps." \
 "The chosen item plays. Browse shows Apps and Up Next. Play works from browse."
 
 step "Playback speed" \
-"Play a podcast in the Podcasts app. Then play a movie in the TV app." \
-"Playback speed select: choose 1.5x, then 1x." \
-"Podcasts: the speed changes. The Playback speed sensor shows it.
-TV app: the select has no options (known limit: the app sends no speed list)."
+"Play something in an app that has a speed setting on the Apple TV." \
+"Look at the Playback speed select. If it has options: choose 1.5x, then 1x." \
+"The select shows only speeds the app reports to the Apple TV. On tvOS 26.6, Podcasts,
+Music, YouTube and the TV app report none, so the select has no options. That is correct.
+If it has options: the speed changes and the Playback speed sensor shows it."
 
 step "Shuffle and repeat" \
 "Play an album in Apple Music." \
@@ -645,13 +648,14 @@ Then use the D-pad and Home of the Apple TV entity right away." \
 "The Apple TV reacts. No 'setup required' errors in the log." \
 "recent_log 'setup|WARN|ERROR'"
 
-step "Power toggle pressed twice fast" \
+step "Power pressed twice" \
 "The Apple TV is on." \
-"Press the power button of the media player entity two times, fast (within 1 s).
-Wait 10 s. Then press Enter here to show the log." \
-"The Apple TV goes to sleep and wakes up again (it ends on).
-The log shows 'toggle -> [TurnOff]' and then 'toggle -> [TurnOn]'." \
-"recent_log 'toggle ->|WARN|ERROR'"
+"Press the power button of the media player entity. Wait 5 s.
+Press it again. Wait 10 s. Then press Enter here to show the log." \
+"The Apple TV goes to sleep, then wakes up again.
+The log shows 'off -> [TurnOff]' and then 'on -> [TurnOn]'.
+Known limit: the Apple TV ignores a wake that comes about 1 s after the sleep command." \
+"recent_log 'off ->|on ->|WARN|ERROR'"
 
 step "Siri two times in a row" \
 "The Apple TV is on." \
