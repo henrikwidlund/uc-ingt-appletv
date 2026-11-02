@@ -38,6 +38,8 @@ const APPS_MARGIN: Duration = Duration::from_secs(30);
 /// Interval for a full reconnect while a protocol is missing.
 const FULL_RECONNECT_INTERVAL: Duration = Duration::from_secs(600);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Longest wait for a running connect before a command runs. The core waits 10 s for the answer.
+const CONNECT_WAIT: Duration = Duration::from_secs(6);
 /// A connection that stayed up this long resets the reconnect delay.
 const STABLE_CONNECTION: Duration = Duration::from_secs(60);
 /// Siri ends if no audio arrives in this time.
@@ -103,6 +105,8 @@ pub struct AppleTvActor {
     s: Snapshot,
     caps: Capabilities,
     status: DeviceStatus,
+    /// Sends each status change. Commands wait on it while a connect runs.
+    status_tx: watch::Sender<DeviceStatus>,
     /// The controller wants a connection.
     want: bool,
     attempts: u32,
@@ -171,6 +175,7 @@ impl AppleTvActor {
             s,
             caps: Capabilities::default(),
             status: DeviceStatus::Disconnected,
+            status_tx: watch::Sender::new(DeviceStatus::Disconnected),
             want: false,
             attempts: 0,
             attempt: 0,
@@ -233,9 +238,16 @@ impl AppleTvActor {
         }
     }
 
+    /// Status updates while a connect runs and there is no connection yet.
+    fn running_connect(&self) -> Option<watch::Receiver<DeviceStatus>> {
+        (self.tv.is_none() && self.status == DeviceStatus::Connecting)
+            .then(|| self.status_tx.subscribe())
+    }
+
     fn set_status(&mut self, status: DeviceStatus) {
         if self.status != status {
             self.status = status;
+            self.status_tx.send_replace(status);
             self.controller.do_send(DeviceEvent::Status {
                 key: self.key.clone(),
                 status,
@@ -1004,9 +1016,13 @@ impl AppleTvActor {
             .and_then(Value::as_u64)
             .and_then(|v| u32::try_from(v).ok())
             .ok_or_else(|| ServiceError::BadRequest("Missing parameter: session_id".into()))?;
-        let tv = self.tv.clone().ok_or(ServiceError::NotConnected)?;
-        if tv.mrp().is_none() {
-            return Err(ServiceError::ServiceUnavailable("Siri needs MRP".into()));
+        // The voice button can wake the Remote. Siri then starts when the connect has ended.
+        let connecting = self.running_connect();
+        if connecting.is_none() {
+            let tv = self.tv.as_ref().ok_or(ServiceError::NotConnected)?;
+            if tv.mrp().is_none() {
+                return Err(ServiceError::ServiceUnavailable("Siri needs MRP".into()));
+            }
         }
         if let Some(old) = self.siri.take() {
             info!(
@@ -1027,7 +1043,11 @@ impl AppleTvActor {
         let controller = self.controller.clone();
         let ready_id = entity_id.clone();
         let lock = self.siri_lock.clone();
-        let fut = async move {
+        let fut = move |tv: Option<AppleTv>| async move {
+            let tv = tv.ok_or(ratv::Error::NotConnected("Apple TV"))?;
+            if tv.mrp().is_none() {
+                return Err(ratv::Error::NotConnected("MRP"));
+            }
             // ratv allows one session. The session before ends after its audio is sent.
             let _active = tokio::time::timeout(SIRI_WAIT, lock.lock_owned())
                 .await
@@ -1061,7 +1081,10 @@ impl AppleTvActor {
             }
             siri.finish().await
         };
-        ctx.spawn(fut.into_actor(self).map(move |result, act, _| {
+        let start = connect_ended(connecting)
+            .into_actor(self)
+            .then(move |(), act, _| fut(act.tv.clone()).into_actor(act));
+        ctx.spawn(start.map(move |result, act, _| {
             if act
                 .siri
                 .as_ref()
@@ -1089,6 +1112,14 @@ impl AppleTvActor {
             act.controller.do_send(DeviceEvent::Assistant(event));
         }));
         Ok(())
+    }
+}
+
+/// Wait until a running connect has ended, at most [`CONNECT_WAIT`].
+async fn connect_ended(status: Option<watch::Receiver<DeviceStatus>>) {
+    if let Some(mut status) = status {
+        let ended = status.wait_for(|s| *s != DeviceStatus::Connecting);
+        let _ = tokio::time::timeout(CONNECT_WAIT, ended).await;
     }
 }
 
@@ -1230,15 +1261,20 @@ impl Handler<Command> for AppleTvActor {
             };
             return Box::pin(fut::ready(result));
         }
-        if self.tv.is_none() {
+        // A command can come right after the Remote wakes up, while the connect still runs.
+        let connecting = self.running_connect();
+        if self.tv.is_none() && connecting.is_none() {
             return Box::pin(fut::ready(Err(ServiceError::NotConnected)));
         }
         // Plan after the command before has ended, so toggles see its result.
         let lock = self.cmd_lock.clone();
         Box::pin(
-            async move { lock.lock_owned().await }
-                .into_actor(self)
-                .then(move |guard, act, _| act.run_command(&msg, guard)),
+            async move {
+                connect_ended(connecting).await;
+                lock.lock_owned().await
+            }
+            .into_actor(self)
+            .then(move |guard, act, _| act.run_command(&msg, guard)),
         )
     }
 }
