@@ -9,7 +9,7 @@ use crate::controller::{Controller, R2RequestMsg, operation_mode};
 use crate::errors::ServiceError;
 use crate::util::{DeserializeMsgData, return_fut_err, return_fut_ok};
 use crate::{APP_VERSION, built_info};
-use actix::{AsyncContext, Handler, ResponseFuture};
+use actix::{Handler, ResponseFuture};
 use log::debug;
 use serde_json::Value;
 use strum::EnumMessage;
@@ -75,23 +75,27 @@ impl Handler<R2RequestMsg> for Controller {
                     &self.drv_metadata
                 )));
             }
+            // The setup messages are handled here and not sent to the mailbox again, so a later
+            // event (for example abort_driver_setup) cannot be handled first.
             R2Request::SetupDriver => {
-                let controller = ctx.address();
-                let ws_id = msg.ws_id.clone();
+                let ws_id = msg.ws_id.to_string();
+                let result = msg
+                    .deserialize()
+                    .map_err(ServiceError::from)
+                    .and_then(|data| self.handle(SetupDriverMsg { ws_id, data }, ctx));
                 return Box::pin(async move {
-                    let data = msg.deserialize()?;
-                    controller.send(SetupDriverMsg { ws_id, data }).await??;
+                    result?;
                     Ok(Some(WsMessage::response(req_id, resp_msg, Value::Null)))
                 });
             }
             R2Request::SetDriverUserData => {
-                let controller = ctx.address();
-                let ws_id = msg.ws_id.clone();
+                let ws_id = msg.ws_id.to_string();
+                let result = msg
+                    .deserialize()
+                    .map_err(ServiceError::from)
+                    .and_then(|data| self.handle(SetDriverUserDataMsg { ws_id, data }, ctx));
                 return Box::pin(async move {
-                    let data = msg.deserialize()?;
-                    controller
-                        .send(SetDriverUserDataMsg { ws_id, data })
-                        .await??;
+                    result?;
                     Ok(Some(WsMessage::response(req_id, resp_msg, Value::Null)))
                 });
             }
@@ -136,7 +140,7 @@ impl Handler<R2RequestMsg> for Controller {
                 }
                 return_fut_ok!(Some(WsMessage::response(req_id, resp_msg, Value::Null)));
             }
-            R2Request::EntityCommand => self.entity_command(msg, resp_msg),
+            R2Request::EntityCommand => self.entity_command(msg, resp_msg, ctx),
             R2Request::BrowseMedia => self.browse_media(msg, resp_msg),
             R2Request::SearchMedia => {
                 return_fut_err!(ServiceError::NotSupported("search_media".into()))

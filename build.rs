@@ -15,6 +15,8 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() -> Result<()> {
+    rerun_if_git_changed();
+
     // Get git version information
     let git_version = get_git_version();
     let git_dirty = is_git_dirty();
@@ -51,16 +53,64 @@ fn get_git_version() -> Option<String> {
     None
 }
 
-fn is_git_dirty() -> bool {
-    // Check if there are any uncommitted changes
-    if let Ok(output) = Command::new("git")
-        .args(["diff-index", "--name-only", "HEAD", "--"])
+/// Run the build script again when the commit or tags change.
+///
+/// Any `rerun-if-changed` turns off the default check of all package files, so the files used by
+/// this script and `built` are listed too.
+fn rerun_if_git_changed() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=Cargo.lock");
+    // Changed source files, for the dirty flag. Cargo checks all files in a folder.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=resources");
+
+    let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--git-dir", "--git-common-dir"])
         .output()
-        && output.status.success()
-    {
-        return !output.stdout.is_empty();
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
     }
-    false
+    let Ok(text) = String::from_utf8(output.stdout) else {
+        return;
+    };
+    let mut lines = text.lines();
+    let (Some(git_dir), Some(common_dir)) = (lines.next(), lines.next()) else {
+        return;
+    };
+    let git_dir = Path::new(git_dir);
+    let common_dir = Path::new(common_dir);
+
+    let head = git_dir.join("HEAD");
+    rerun_if_exists(&head);
+    // The file of the current branch, for example `refs/heads/main`.
+    if let Ok(head) = std::fs::read_to_string(&head)
+        && let Some(reference) = head.strip_prefix("ref: ")
+    {
+        rerun_if_exists(&common_dir.join(reference.trim()));
+    }
+    rerun_if_exists(&common_dir.join("refs/tags"));
+    rerun_if_exists(&common_dir.join("packed-refs"));
+    // Changes to tracked files, for the dirty flag.
+    rerun_if_exists(&git_dir.join("index"));
+}
+
+fn rerun_if_exists(path: &Path) {
+    if path.exists() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
+fn is_git_dirty() -> bool {
+    // Check if there are any uncommitted changes. `git diff` compares the content, so files that
+    // were touched but not changed are not dirty. It does not write the index.
+    Command::new("git")
+        .args(["--no-optional-locks", "diff", "--quiet", "HEAD", "--"])
+        .status()
+        .is_ok_and(|s| s.code() == Some(1))
 }
 
 fn write_git_info(git_version: Option<String>, git_dirty: bool) {

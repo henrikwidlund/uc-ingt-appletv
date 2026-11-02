@@ -89,6 +89,14 @@ pub enum SetupState {
     Configure { key: String, found: Vec<Found> },
 }
 
+/// Error of the input of a setup page.
+enum InputError {
+    /// Invalid input. The page is shown again with the message.
+    Invalid(Box<SetupState>, String),
+    /// The setup flow ends with this error.
+    Failed(IntegrationSetupError),
+}
+
 impl Handler<SetupDriverMsg> for Controller {
     type Result = Result<(), ServiceError>;
 
@@ -103,21 +111,33 @@ impl Handler<SetupDriverMsg> for Controller {
             ));
         }
         let reconfigure = msg.data.reconfigure == Some(true);
-        if let Some(session) = self.sessions.get_mut(&msg.ws_id) {
+        if let Some(session) = self.sessions.get_mut(msg.ws_id.as_str()) {
             session.reconfiguring = msg.data.reconfigure;
         }
-        self.setup = None;
+        self.end_setup_flow();
+        self.setup_owner = Some(msg.ws_id.as_str().into());
+        let flow = self.setup_flow;
         let ws_id = msg.ws_id;
         if reconfigure {
             ctx.run_later(ACK_DELAY, move |act, ctx| {
+                if !act.is_setup_flow(flow, &ws_id) {
+                    return;
+                }
                 let page = act.config_mode_page();
                 act.setup = Some(SetupState::ConfigMode);
                 act.request_input(&ws_id, page, ctx);
             });
         } else {
             // A first setup starts with a clean configuration.
-            self.reset_devices()?;
-            ctx.run_later(ACK_DELAY, move |act, ctx| act.request_discover(&ws_id, ctx));
+            if let Err(e) = self.reset_devices() {
+                self.finish_setup(&ws_id, Some(IntegrationSetupError::Other), ctx);
+                return Err(e);
+            }
+            ctx.run_later(ACK_DELAY, move |act, ctx| {
+                if act.is_setup_flow(flow, &ws_id) {
+                    act.request_discover(&ws_id, ctx);
+                }
+            });
         }
         Ok(())
     }
@@ -129,11 +149,12 @@ impl Handler<SetDriverUserDataMsg> for Controller {
     fn handle(&mut self, msg: SetDriverUserDataMsg, ctx: &mut Self::Context) -> Self::Result {
         debug!("[{}] setup user data", msg.ws_id);
         if self
-            .sm_consume(&msg.ws_id, &operation_mode::Input::SetupUserData, ctx)
-            .is_err()
+            .setup_owner
+            .as_deref()
+            .is_some_and(|owner| owner != msg.ws_id)
         {
             return Err(ServiceError::BadRequest(
-                "Not waiting for driver user data. Please restart setup.".into(),
+                "Setup was started by another Remote.".into(),
             ));
         }
         let IntegrationSetup::InputValues(values) = msg.data else {
@@ -141,60 +162,39 @@ impl Handler<SetDriverUserDataMsg> for Controller {
                 "Invalid response: require input_values".into(),
             ));
         };
+        if self
+            .sm_consume(&msg.ws_id, &operation_mode::Input::SetupUserData, ctx)
+            .is_err()
+        {
+            return Err(ServiceError::BadRequest(
+                "Not waiting for driver user data. Please restart setup.".into(),
+            ));
+        }
         let ws_id = msg.ws_id;
-        let state = self.setup.take();
-        match state {
-            Some(SetupState::Discover) => {
-                let address = parse_address(values.get("address").map(String::as_str))?;
-                ctx.run_later(ACK_DELAY, move |act, ctx| act.discover(ws_id, address, ctx));
-            }
-            Some(SetupState::ConfigMode) => self.config_mode(ws_id, &values, ctx)?,
-            Some(SetupState::ChooseDevice {
-                found,
-                manual_address,
-            }) => {
-                let choice = values.get("choice").map(String::as_str).unwrap_or_default();
-                let found = found
-                    .into_iter()
-                    .find(|f| f.id == choice)
-                    .ok_or_else(|| ServiceError::BadRequest("Unknown device".into()))?;
-                let global_volume = parse_bool(&values, "global_volume", true);
+        let Some(step) = self.setup.take() else {
+            self.finish_setup(&ws_id, Some(IntegrationSetupError::Other), ctx);
+            return Err(ServiceError::BadRequest("No active setup step".into()));
+        };
+        let flow = self.setup_flow;
+        match self.setup_input(&ws_id, step, &values, ctx) {
+            Ok(()) => {}
+            Err(InputError::Invalid(step, message)) => {
+                info!("[{ws_id}] invalid setup input: {message}");
+                // Show the same page again.
+                self.setup = Some(*step);
                 ctx.run_later(ACK_DELAY, move |act, ctx| {
-                    act.pair(ws_id, found, global_volume, manual_address, None, ctx);
+                    if act.is_setup_flow(flow, &ws_id) {
+                        act.request_input_again(&ws_id, &message, ctx);
+                    }
                 });
             }
-            Some(SetupState::Pin {
-                prompt,
-                found,
-                global_volume,
-                manual_address,
-                replace,
-            }) => {
-                let pin = values
-                    .get("pin")
-                    .map(|p| p.trim().to_string())
-                    .unwrap_or_default();
-                if pin.is_empty() {
-                    return Err(ServiceError::BadRequest("Missing PIN".into()));
-                }
-                self.finish_pairing(
-                    ws_id,
-                    prompt,
-                    pin,
-                    found,
-                    global_volume,
-                    manual_address,
-                    replace,
-                    ctx,
-                );
-            }
-            Some(SetupState::Configure { key, found }) => {
-                self.configure(&key, &found, &values)?;
+            Err(InputError::Failed(error)) => {
                 ctx.run_later(ACK_DELAY, move |act, ctx| {
-                    act.finish_setup(&ws_id, None, ctx);
+                    if act.is_setup_flow(flow, &ws_id) {
+                        act.finish_setup(&ws_id, Some(error), ctx);
+                    }
                 });
             }
-            None => return Err(ServiceError::BadRequest("No active setup step".into())),
         }
         Ok(())
     }
@@ -204,37 +204,154 @@ impl Handler<AbortDriverSetup> for Controller {
     type Result = ();
 
     fn handle(&mut self, msg: AbortDriverSetup, ctx: &mut Self::Context) {
-        debug!(
-            "[{}] abort driver setup, timeout: {}",
-            msg.ws_id, msg.timeout
-        );
-        self.setup = None;
-        if msg.timeout {
-            self.finish_setup(&msg.ws_id, Some(IntegrationSetupError::Timeout), ctx);
+        self.abort_setup(&msg.ws_id, msg.timeout, ctx);
+    }
+}
+
+impl Controller {
+    /// Abort the setup flow, because of a timeout, an abort event or a disconnect of the Remote.
+    pub(super) fn abort_setup(&mut self, ws_id: &str, timeout: bool, ctx: &mut Context<Self>) {
+        debug!("[{ws_id}] abort driver setup, timeout: {timeout}");
+        if self
+            .setup_owner
+            .as_deref()
+            .is_some_and(|owner| owner != ws_id)
+        {
+            warn!("[{ws_id}] setup was started by another Remote, not aborting");
             return;
         }
+        if timeout {
+            self.finish_setup(ws_id, Some(IntegrationSetupError::Timeout), ctx);
+            return;
+        }
+        self.end_setup_flow();
         if self
-            .sm_consume(&msg.ws_id, &operation_mode::Input::AbortSetup, ctx)
+            .sm_consume(ws_id, &operation_mode::Input::AbortSetup, ctx)
             .is_err()
         {
             return;
         }
         // A reconfiguration that was aborted keeps the configured devices.
-        if let Some(session) = self.sessions.get_mut(&msg.ws_id) {
+        if let Some(session) = self.sessions.get_mut(ws_id) {
             session.reconfiguring = None;
         }
         if !self.devices.is_empty() {
-            let _ = self.sm_consume(
-                &msg.ws_id,
-                &operation_mode::Input::ConfigurationAvailable,
-                ctx,
-            );
+            let _ = self.sm_consume(ws_id, &operation_mode::Input::ConfigurationAvailable, ctx);
             self.connect_devices();
         }
     }
-}
 
-impl Controller {
+    /// Forget the active setup flow. Tasks of the old flow are ignored.
+    fn end_setup_flow(&mut self) {
+        self.setup = None;
+        self.setup_owner = None;
+        self.setup_flow = self.setup_flow.wrapping_add(1);
+    }
+
+    /// Returns `true` if `flow` is the active setup flow.
+    fn is_setup_flow(&self, flow: u32, ws_id: &str) -> bool {
+        let active = self.setup_flow == flow;
+        if !active {
+            debug!("[{ws_id}] ignoring result of an old setup flow");
+        }
+        active
+    }
+
+    /// Handle the input of a setup page.
+    fn setup_input(
+        &mut self,
+        ws_id: &str,
+        step: SetupState,
+        values: &HashMap<String, String>,
+        ctx: &mut Context<Self>,
+    ) -> Result<(), InputError> {
+        let flow = self.setup_flow;
+        let ws_id = ws_id.to_string();
+        match step {
+            SetupState::Discover => {
+                let address = parse_address(values.get("address").map(String::as_str))
+                    .map_err(|e| InputError::Invalid(Box::new(SetupState::Discover), e))?;
+                ctx.run_later(ACK_DELAY, move |act, ctx| {
+                    if act.is_setup_flow(flow, &ws_id) {
+                        act.discover(ws_id, address, ctx);
+                    }
+                });
+            }
+            SetupState::ConfigMode => self.config_mode(ws_id, values, ctx)?,
+            SetupState::ChooseDevice {
+                mut found,
+                manual_address,
+            } => {
+                let choice = values.get("choice").map(String::as_str).unwrap_or_default();
+                let Some(i) = found.iter().position(|f| f.id == choice) else {
+                    return Err(InputError::Invalid(
+                        Box::new(SetupState::ChooseDevice {
+                            found,
+                            manual_address,
+                        }),
+                        "Unknown device".into(),
+                    ));
+                };
+                let found = found.swap_remove(i);
+                let global_volume = parse_bool(values, "global_volume", true);
+                ctx.run_later(ACK_DELAY, move |act, ctx| {
+                    if act.is_setup_flow(flow, &ws_id) {
+                        act.pair(ws_id, found, global_volume, manual_address, None, ctx);
+                    }
+                });
+            }
+            SetupState::Pin {
+                prompt,
+                found,
+                global_volume,
+                manual_address,
+                replace,
+            } => {
+                let pin = values.get("pin").map_or("", |p| p.trim());
+                if pin.is_empty() {
+                    return Err(InputError::Invalid(
+                        Box::new(SetupState::Pin {
+                            prompt,
+                            found,
+                            global_volume,
+                            manual_address,
+                            replace,
+                        }),
+                        "Missing PIN".into(),
+                    ));
+                }
+                self.finish_pairing(
+                    ws_id,
+                    prompt,
+                    pin.to_string(),
+                    found,
+                    global_volume,
+                    manual_address,
+                    replace,
+                    ctx,
+                );
+            }
+            SetupState::Configure { key, found } => {
+                let address = match parse_address(values.get("address").map(String::as_str)) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return Err(InputError::Invalid(
+                            Box::new(SetupState::Configure { key, found }),
+                            e,
+                        ));
+                    }
+                };
+                let error = self.configure(&key, &found, address, values).err();
+                ctx.run_later(ACK_DELAY, move |act, ctx| {
+                    if act.is_setup_flow(flow, &ws_id) {
+                        act.finish_setup(&ws_id, error, ctx);
+                    }
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Ask for an optional IP address, then discover.
     fn request_discover(&mut self, ws_id: &str, ctx: &mut Context<Self>) {
         self.setup = Some(SetupState::Discover);
@@ -244,10 +361,14 @@ impl Controller {
     /// Scan for Apple TVs and show the ones that are not configured.
     fn discover(&self, ws_id: String, address: Option<IpAddr>, ctx: &mut Context<Self>) {
         info!("[{ws_id}] discovering Apple TV devices, address: {address:?}");
+        let flow = self.setup_flow;
         ctx.spawn(
             async move { discovery::scan_apple_tvs(address).await }
                 .into_actor(self)
                 .map(move |result, act, ctx| {
+                    if !act.is_setup_flow(flow, &ws_id) {
+                        return;
+                    }
                     let devices = match result {
                         Ok(d) => d,
                         Err(e) => {
@@ -285,54 +406,77 @@ impl Controller {
         ws_id: String,
         values: &HashMap<String, String>,
         ctx: &mut Context<Self>,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<(), InputError> {
+        let unknown_device =
+            || InputError::Invalid(Box::new(SetupState::ConfigMode), "Unknown device".into());
+        let flow = self.setup_flow;
         let action = values.get("action").map(String::as_str).unwrap_or_default();
-        let key = values.get("choice").cloned().unwrap_or_default();
+        let key = values.get("choice").map(String::as_str).unwrap_or_default();
         match action {
             "add" => {
-                ctx.run_later(ACK_DELAY, move |act, ctx| act.request_discover(&ws_id, ctx));
+                ctx.run_later(ACK_DELAY, move |act, ctx| {
+                    if act.is_setup_flow(flow, &ws_id) {
+                        act.request_discover(&ws_id, ctx);
+                    }
+                });
             }
             "remove" => {
-                let cfg = self
-                    .remove_device(&key)
-                    .ok_or_else(|| ServiceError::BadRequest("Unknown device".into()))?;
+                let cfg = self.remove_device(key).ok_or_else(unknown_device)?;
                 info!("[{ws_id}] removed {}", cfg.name);
-                self.save_devices()?;
                 for session in self.sessions.values_mut() {
                     session
                         .subscribed_entities
                         .retain(|id| EntityKind::parse(id).is_none_or(|(k, _)| k != key));
                 }
+                if let Err(e) = self.save_devices() {
+                    warn!("[{ws_id}] saving the configuration failed: {e}");
+                    return Err(InputError::Failed(IntegrationSetupError::Other));
+                }
                 ctx.run_later(ACK_DELAY, move |act, ctx| {
-                    act.finish_setup(&ws_id, None, ctx);
+                    if act.is_setup_flow(flow, &ws_id) {
+                        act.finish_setup(&ws_id, None, ctx);
+                    }
                 });
             }
             "configure" => {
                 let cfg = self
                     .devices
-                    .get(key.as_str())
-                    .ok_or_else(|| ServiceError::BadRequest("Unknown device".into()))?
+                    .get(key)
+                    .ok_or_else(unknown_device)?
                     .cfg
                     .clone();
                 self.request_configure(ws_id, cfg, ctx);
             }
             "pair" => {
-                let device = self
+                let cfg = self
                     .devices
-                    .get(key.as_str())
-                    .ok_or_else(|| ServiceError::BadRequest("Unknown device".into()))?;
-                let cfg = device.cfg.clone();
-                ctx.run_later(ACK_DELAY, move |act, ctx| act.pair_again(ws_id, cfg, ctx));
+                    .get(key)
+                    .ok_or_else(unknown_device)?
+                    .cfg
+                    .clone();
+                ctx.run_later(ACK_DELAY, move |act, ctx| {
+                    if act.is_setup_flow(flow, &ws_id) {
+                        act.pair_again(ws_id, cfg, ctx);
+                    }
+                });
             }
             "reset" => {
-                self.reset_devices()?;
+                if let Err(e) = self.reset_devices() {
+                    warn!("[{ws_id}] saving the configuration failed: {e}");
+                    return Err(InputError::Failed(IntegrationSetupError::Other));
+                }
                 info!("[{ws_id}] configuration reset");
-                ctx.run_later(ACK_DELAY, move |act, ctx| act.request_discover(&ws_id, ctx));
+                ctx.run_later(ACK_DELAY, move |act, ctx| {
+                    if act.is_setup_flow(flow, &ws_id) {
+                        act.request_discover(&ws_id, ctx);
+                    }
+                });
             }
             _ => {
-                return Err(ServiceError::BadRequest(format!(
-                    "Unknown action: {action}"
-                )));
+                return Err(InputError::Invalid(
+                    Box::new(SetupState::ConfigMode),
+                    format!("Unknown action: {action}"),
+                ));
             }
         }
         Ok(())
@@ -356,10 +500,14 @@ impl Controller {
 
     /// Scan the network, then show the options of a configured device.
     fn request_configure(&self, ws_id: String, cfg: DeviceConfig, ctx: &mut Context<Self>) {
+        let flow = self.setup_flow;
         ctx.spawn(
             async move { discovery::scan_apple_tvs(None).await }
                 .into_actor(self)
                 .map(move |result, act, ctx| {
+                    if !act.is_setup_flow(flow, &ws_id) {
+                        return;
+                    }
                     let devices = result.unwrap_or_else(|e| {
                         warn!("[{ws_id}] discovery failed: {e}");
                         Vec::new()
@@ -388,37 +536,45 @@ impl Controller {
 
     /// Find a configured device and pair it again.
     fn pair_again(&self, ws_id: String, cfg: DeviceConfig, ctx: &mut Context<Self>) {
+        let flow = self.setup_flow;
         ctx.spawn(
             async move {
                 let found = discovery::find(&cfg).await;
                 (cfg, found)
             }
             .into_actor(self)
-            .map(move |(cfg, result), act, ctx| match result {
-                Ok(Some(device)) => {
-                    let Some(mut found) = Found::new(&device) else {
-                        act.finish_setup(&ws_id, Some(IntegrationSetupError::NotFound), ctx);
-                        return;
-                    };
-                    // Keep the id from the first pairing.
-                    found.id.clone_from(&cfg.id);
-                    found.name.clone_from(&cfg.name);
-                    if cfg.manual_address {
-                        found.address = cfg.address;
-                    }
-                    act.pair(
-                        ws_id,
-                        found,
-                        cfg.global_volume,
-                        cfg.manual_address,
-                        Some(cfg.key),
-                        ctx,
-                    );
+            .map(move |(cfg, result), act, ctx| {
+                if !act.is_setup_flow(flow, &ws_id) {
+                    return;
                 }
-                Ok(None) => act.finish_setup(&ws_id, Some(IntegrationSetupError::NotFound), ctx),
-                Err(e) => {
-                    warn!("[{ws_id}] discovery failed: {e}");
-                    act.finish_setup(&ws_id, Some(IntegrationSetupError::Other), ctx);
+                match result {
+                    Ok(Some(device)) => {
+                        let Some(mut found) = Found::new(&device) else {
+                            act.finish_setup(&ws_id, Some(IntegrationSetupError::NotFound), ctx);
+                            return;
+                        };
+                        // Keep the id from the first pairing.
+                        found.id.clone_from(&cfg.id);
+                        found.name.clone_from(&cfg.name);
+                        if cfg.manual_address {
+                            found.address = cfg.address;
+                        }
+                        act.pair(
+                            ws_id,
+                            found,
+                            cfg.global_volume,
+                            cfg.manual_address,
+                            Some(cfg.key),
+                            ctx,
+                        );
+                    }
+                    Ok(None) => {
+                        act.finish_setup(&ws_id, Some(IntegrationSetupError::NotFound), ctx);
+                    }
+                    Err(e) => {
+                        warn!("[{ws_id}] discovery failed: {e}");
+                        act.finish_setup(&ws_id, Some(IntegrationSetupError::Other), ctx);
+                    }
                 }
             }),
         );
@@ -438,24 +594,30 @@ impl Controller {
         let mut options = PairOptions::default();
         options.name.clone_from(&self.device_ctx.client_name);
         let endpoints = found.endpoints;
+        let flow = self.setup_flow;
         ctx.spawn(
             async move { ratv::pair(&endpoints, &options).await }
                 .into_actor(self)
-                .map(move |result, act, ctx| match result {
-                    Ok(prompt) => {
-                        let page = pin_page(&found.name);
-                        act.setup = Some(SetupState::Pin {
-                            prompt: Box::new(prompt),
-                            found,
-                            global_volume,
-                            manual_address,
-                            replace,
-                        });
-                        act.request_input(&ws_id, page, ctx);
+                .map(move |result, act, ctx| {
+                    if !act.is_setup_flow(flow, &ws_id) {
+                        return;
                     }
-                    Err(e) => {
-                        warn!("[{ws_id}] pairing failed: {e}");
-                        act.finish_setup(&ws_id, Some(setup_error(&e)), ctx);
+                    match result {
+                        Ok(prompt) => {
+                            let page = pin_page(&found.name);
+                            act.setup = Some(SetupState::Pin {
+                                prompt: Box::new(prompt),
+                                found,
+                                global_volume,
+                                manual_address,
+                                replace,
+                            });
+                            act.request_input(&ws_id, page, ctx);
+                        }
+                        Err(e) => {
+                            warn!("[{ws_id}] pairing failed: {e}");
+                            act.finish_setup(&ws_id, Some(setup_error(&e)), ctx);
+                        }
                     }
                 }),
         );
@@ -473,10 +635,16 @@ impl Controller {
         replace: Option<String>,
         ctx: &mut Context<Self>,
     ) {
+        let flow = self.setup_flow;
         ctx.spawn(
             async move { prompt.finish(&pin).await }
                 .into_actor(self)
                 .map(move |result, act, ctx| {
+                    // The setup was aborted or timed out: the user did not wait for the result.
+                    // The pairing is not saved.
+                    if !act.is_setup_flow(flow, &ws_id) {
+                        return;
+                    }
                     let credentials = match result {
                         Ok(c) => c,
                         Err(e) => {
@@ -528,47 +696,85 @@ impl Controller {
         &mut self,
         key: &str,
         found: &[Found],
+        address: Option<IpAddr>,
         values: &HashMap<String, String>,
-    ) -> Result<(), ServiceError> {
-        let address = parse_address(values.get("address").map(String::as_str))?;
+    ) -> Result<(), IntegrationSetupError> {
         let device = self
             .devices
             .get_mut(key)
-            .ok_or_else(|| ServiceError::BadRequest("Unknown device".into()))?;
+            .ok_or(IntegrationSetupError::NotFound)?;
         let cfg = &mut device.cfg;
-        // The identifiers can all change, for example after a tvOS update. Link to the chosen device.
-        let choice = values.get("device").map(String::as_str).unwrap_or_default();
-        if let Some(f) = found.iter().find(|f| f.id == choice)
-            && !cfg.matches(f.known_ids.iter().map(String::as_str))
-        {
-            info!("[{}] linked to {} ({:?})", cfg.name, f.name, f.known_ids);
-            cfg.known_ids.clone_from(&f.known_ids);
-            if !cfg.manual_address {
-                cfg.address = f.address;
-            }
-        }
         cfg.global_volume = parse_bool(values, "global_volume", cfg.global_volume);
         cfg.manual_address = address.is_some();
         if address.is_some() {
             cfg.address = address;
         }
+        // The identifiers can all change, for example after a tvOS update. Link to the chosen device.
+        let choice = values.get("device").map(String::as_str).unwrap_or_default();
+        if let Some(f) = found.iter().find(|f| f.id == choice) {
+            if !cfg.matches(f.known_ids.iter().map(String::as_str)) {
+                info!("[{}] linked to {} ({:?})", cfg.name, f.name, f.known_ids);
+                cfg.known_ids.clone_from(&f.known_ids);
+            }
+            // Without a manual address, use the address of the found device.
+            if !cfg.manual_address && f.address.is_some() {
+                cfg.address = f.address;
+            }
+        }
         device.addr.do_send(UpdateConfig(cfg.clone()));
-        self.save_devices()
+        self.save_devices().map_err(|e| {
+            warn!("Saving the configuration failed: {e}");
+            IntegrationSetupError::Other
+        })
     }
 
     /// Show a setup page.
     fn request_input(&mut self, ws_id: &str, page: Value, ctx: &mut Context<Self>) {
+        self.send_input_request(ws_id, page, None, ctx);
+    }
+
+    /// Show the page of the current step again, with an error message.
+    fn request_input_again(&mut self, ws_id: &str, message: &str, ctx: &mut Context<Self>) {
+        let page = match &self.setup {
+            Some(SetupState::Discover) => Some(discover_page()),
+            Some(SetupState::ConfigMode) => Some(self.config_mode_page()),
+            Some(SetupState::ChooseDevice { found, .. }) => Some(choose_device_page(found)),
+            Some(SetupState::Pin { found, .. }) => Some(pin_page(&found.name)),
+            Some(SetupState::Configure { key, found }) => self
+                .devices
+                .get(key.as_str())
+                .map(|d| configure_page(&d.cfg, found)),
+            None => None,
+        };
+        match page {
+            Some(page) => self.send_input_request(ws_id, page, Some(message), ctx),
+            None => self.finish_setup(ws_id, Some(IntegrationSetupError::Other), ctx),
+        }
+    }
+
+    /// Send a setup page. With `error`, the page is shown again because of invalid input.
+    fn send_input_request(
+        &mut self,
+        ws_id: &str,
+        page: Value,
+        error: Option<&str>,
+        ctx: &mut Context<Self>,
+    ) {
         if self
             .sm_consume(ws_id, &operation_mode::Input::RequestUserInput, ctx)
             .is_err()
         {
             return;
         }
-        let event = json!({
+        let mut event = json!({
             "event_type": SetupChangeEventType::Setup,
             "state": IntegrationSetupState::WaitUserAction,
             "require_user_action": { "input": page },
         });
+        if let Some(message) = error {
+            event["error"] = json!(IntegrationSetupError::InvalidInput);
+            event["error_message"] = json!({ "en": message });
+        }
         self.send_r2_msg(
             WsMessage::event("driver_setup_change", EventCategory::Device, event),
             ws_id,
@@ -582,7 +788,7 @@ impl Controller {
         error: Option<IntegrationSetupError>,
         ctx: &mut Context<Self>,
     ) {
-        self.setup = None;
+        self.end_setup_flow();
         let input = if error.is_none() {
             operation_mode::Input::Successful
         } else {
@@ -593,6 +799,10 @@ impl Controller {
         }
         if let Some(session) = self.sessions.get_mut(ws_id) {
             session.reconfiguring = None;
+        }
+        // Configured devices keep working after a failed setup.
+        if error.is_some() && !self.devices.is_empty() {
+            let _ = self.sm_consume(ws_id, &operation_mode::Input::ConfigurationAvailable, ctx);
         }
         if matches!(self.machine.state(), operation_mode::State::Running) {
             self.connect_devices();
@@ -752,13 +962,13 @@ fn configure_page(cfg: &DeviceConfig, found: &[Found]) -> Value {
     })
 }
 
-fn parse_address(value: Option<&str>) -> Result<Option<IpAddr>, ServiceError> {
+fn parse_address(value: Option<&str>) -> Result<Option<IpAddr>, String> {
     match value.map(str::trim) {
         None | Some("") => Ok(None),
         Some(v) => v
             .parse()
             .map(Some)
-            .map_err(|_| ServiceError::BadRequest(format!("Invalid IP address: {v}"))),
+            .map_err(|_| format!("Invalid IP address: {v}")),
     }
 }
 
@@ -789,5 +999,139 @@ mod tests {
             parse_address(Some("10.0.0.2")).expect("ok")
         );
         assert!(parse_address(Some("tv.local")).is_err());
+    }
+
+    mod flow {
+        use crate::configuration::{HeartbeatSettings, Settings};
+        use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
+        use crate::controller::{Controller, NewR2Session, R2SessionDisconnect, SendWsMessage};
+        use crate::server::ArtworkStore;
+        use actix::{Actor, Addr, Context, Handler};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use uc_api::intg::IntegrationSetup;
+
+        /// Collects the events sent to a Remote.
+        struct Remote(Arc<Mutex<Vec<Value>>>);
+
+        impl Actor for Remote {
+            type Context = Context<Self>;
+        }
+
+        impl Handler<SendWsMessage> for Remote {
+            type Result = ();
+            fn handle(&mut self, msg: SendWsMessage, _: &mut Context<Self>) {
+                if let (Some("driver_setup_change"), Some(data)) =
+                    (msg.0.msg.as_deref(), msg.0.msg_data)
+                    && let Ok(mut events) = self.0.lock()
+                {
+                    events.push(data);
+                }
+            }
+        }
+
+        fn controller(name: &str) -> Addr<Controller> {
+            let dir =
+                std::env::temp_dir().join(format!("uc-intg-appletv-{name}-{}", std::process::id()));
+            let settings = Settings {
+                interface: "127.0.0.1".into(),
+                http_port: 0,
+                config_home: dir.clone(),
+                client_name: "test".into(),
+                heartbeat: HeartbeatSettings::default(),
+            };
+            let metadata = serde_json::from_value(json!({})).expect("metadata");
+            Controller::new(settings, metadata, ArtworkStore::new(dir.join("artwork"))).start()
+        }
+
+        async fn connect(controller: &Addr<Controller>, id: &str) -> Arc<Mutex<Vec<Value>>> {
+            let events = Arc::default();
+            let addr = Remote(Arc::clone(&events)).start();
+            controller
+                .send(NewR2Session {
+                    addr: addr.recipient(),
+                    id: id.into(),
+                })
+                .await
+                .expect("send");
+            events
+        }
+
+        fn input(ws_id: &str, address: &str) -> SetDriverUserDataMsg {
+            SetDriverUserDataMsg {
+                ws_id: ws_id.into(),
+                data: IntegrationSetup::InputValues([("address".into(), address.into())].into()),
+            }
+        }
+
+        fn last(events: &Mutex<Vec<Value>>) -> Value {
+            events
+                .lock()
+                .expect("lock")
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        #[actix::test]
+        async fn invalid_input_shows_the_page_again() {
+            let controller = controller("invalid-input");
+            let events = connect(&controller, "a").await;
+            connect(&controller, "b").await;
+            let data = serde_json::from_value(json!({ "setup_data": {} })).expect("setup");
+            controller
+                .send(SetupDriverMsg {
+                    ws_id: "a".into(),
+                    data,
+                })
+                .await
+                .expect("send")
+                .expect("setup started");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(json!("WAIT_USER_ACTION"), last(&events)["state"]);
+
+            // Another Remote cannot send input.
+            assert!(
+                controller
+                    .send(input("b", ""))
+                    .await
+                    .expect("send")
+                    .is_err()
+            );
+
+            controller
+                .send(input("a", "no-ip"))
+                .await
+                .expect("send")
+                .expect("ok");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let event = last(&events);
+            assert_eq!(json!("WAIT_USER_ACTION"), event["state"]);
+            assert_eq!(json!("INVALID_INPUT"), event["error"]);
+            assert!(event["require_user_action"]["input"].is_object());
+
+            // The setup still waits for input.
+            controller
+                .send(input("a", "also-no-ip"))
+                .await
+                .expect("send")
+                .expect("ok");
+
+            // A disconnect of the owner ends the setup, so another Remote can start one.
+            controller
+                .send(R2SessionDisconnect { id: "a".into() })
+                .await
+                .expect("send");
+            let data = serde_json::from_value(json!({ "setup_data": {} })).expect("setup");
+            controller
+                .send(SetupDriverMsg {
+                    ws_id: "b".into(),
+                    data,
+                })
+                .await
+                .expect("send")
+                .expect("setup started");
+        }
     }
 }

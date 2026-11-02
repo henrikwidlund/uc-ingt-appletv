@@ -41,6 +41,8 @@ impl Dirty {
     pub const RATE: Self = Self(1 << 12);
     pub const SHUFFLE_REPEAT: Self = Self(1 << 13);
     pub const ACCOUNTS: Self = Self(1 << 14);
+    /// The current chapter changed, but not the list.
+    pub const CHAPTER: Self = Self(1 << 15);
     pub const ALL: Self = Self(u32::MAX);
 
     /// Returns `true` if any group of `other` is dirty.
@@ -357,12 +359,25 @@ impl Snapshot {
 
     /// Set the installed apps. They are sorted by name, case-insensitive.
     pub fn set_apps(&mut self, mut apps: Vec<AppInfo>) -> Dirty {
-        apps.sort_unstable_by_key(|a| a.name.to_lowercase());
+        apps.sort_unstable_by(|a, b| {
+            let a = a.name.chars().flat_map(char::to_lowercase);
+            a.cmp(b.name.chars().flat_map(char::to_lowercase))
+        });
         if self.apps == apps {
             return Dirty::NONE;
         }
         self.apps = apps;
         Dirty::APPS
+    }
+
+    /// Set the device name. The output names include it.
+    pub fn set_name(&mut self, name: &str) -> Dirty {
+        if self.name == name {
+            return Dirty::NONE;
+        }
+        name.clone_into(&mut self.name);
+        self.rebuild_output_combos();
+        Dirty::OUTPUTS
     }
 
     pub fn set_accounts(&mut self, accounts: Vec<AccountInfo>) -> Dirty {
@@ -719,6 +734,31 @@ mod tests {
             v
         });
         assert_eq!(Some(2), s.current_output_combo());
+    }
+
+    #[test]
+    fn rename_updates_output_names() {
+        let mut s = Snapshot {
+            name: "Old".into(),
+            ..Snapshot::default()
+        };
+        s.set_airplay_devices(vec![("K".into(), "Kitchen".into())]);
+        assert_eq!(Dirty::OUTPUTS, s.set_name("New"));
+        assert_eq!(Dirty::NONE, s.set_name("New"));
+        let names: Vec<_> = s.output_combos.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(vec!["New", "New, Kitchen"], names);
+    }
+
+    #[test]
+    fn apps_sorted_case_insensitive() {
+        let app = |name: &str| AppInfo {
+            bundle_id: name.into(),
+            name: name.into(),
+        };
+        let mut s = Snapshot::default();
+        s.set_apps(vec![app("b"), app("C"), app("a")]);
+        let names: Vec<_> = s.apps.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(vec!["a", "b", "C"], names);
     }
 
     #[test]

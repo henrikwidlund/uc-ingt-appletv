@@ -90,13 +90,8 @@ pub async fn find(cfg: &DeviceConfig) -> Result<Option<Device>, ratv::Error> {
 /// Returns `true` if something changed.
 pub fn update_config(cfg: &mut DeviceConfig, device: &Device) -> bool {
     let mut changed = false;
-    let ids: Vec<String> = device_ids(device).map(str::to_string).collect();
-    if !ids.is_empty() && ids != cfg.known_ids {
-        info!(
-            "[{}] identifiers changed: {:?} -> {ids:?}",
-            cfg.name, cfg.known_ids
-        );
-        cfg.known_ids = ids;
+    for id in merge_ids(&mut cfg.known_ids, device_ids(device)) {
+        info!("[{}] new identifier: {id}", cfg.name);
         changed = true;
     }
     let name = device.name();
@@ -114,6 +109,26 @@ pub fn update_config(cfg: &mut DeviceConfig, device: &Device) -> bool {
         changed = true;
     }
     changed
+}
+
+/// Add the ids that are not known yet and return them. Known ids are kept: a scan may not see
+/// all services.
+fn merge_ids<'a>(
+    known: &mut Vec<String>,
+    ids: impl Iterator<Item = &'a str>,
+) -> impl Iterator<Item = &'a str> {
+    ids.filter(|id| {
+        if known.iter().any(|k| k == id) {
+            return false;
+        }
+        known.push((*id).to_string());
+        true
+    })
+}
+
+/// Returns `true` if both lists have the same ids, in any order.
+pub fn same_ids(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().all(|id| b.contains(id)) && b.iter().all(|id| a.contains(id))
 }
 
 /// Scan for AirPlay devices that can join the group of an Apple TV: (output uid, name).
@@ -141,6 +156,25 @@ pub async fn scan_airplay_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_keeps_known_ids() {
+        let mut known = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(0, merge_ids(&mut known, ["b"].into_iter()).count());
+        assert_eq!(
+            vec!["c"],
+            merge_ids(&mut known, ["c", "a"].into_iter()).collect::<Vec<_>>()
+        );
+        assert_eq!(vec!["a", "b", "c"], known);
+    }
+
+    #[test]
+    fn same_ids_in_any_order() {
+        let a = ["x".to_string(), "y".to_string()];
+        let b = ["y".to_string(), "x".to_string()];
+        assert!(same_ids(&a, &b));
+        assert!(!same_ids(&a, &b[..1]));
+    }
 
     #[test]
     fn supported_models() {

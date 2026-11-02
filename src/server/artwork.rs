@@ -13,8 +13,9 @@ use actix_web::{HttpResponse, get, web};
 use log::{debug, warn};
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// Time the Remote may cache an image. A file name always has the same image.
 const CACHE_CONTROL: &str = "max-age=86400";
@@ -31,8 +32,18 @@ pub struct ArtworkStore {
 #[derive(Debug)]
 struct Inner {
     dir: PathBuf,
+    files: Mutex<Files>,
+    /// Makes the temporary file names unique.
+    tmp_seq: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct Files {
     /// File names per device, the oldest first.
-    files: Mutex<HashMap<Box<str>, VecDeque<Box<str>>>>,
+    names: HashMap<Box<str>, VecDeque<Box<str>>>,
+    /// Number of [`ArtworkStore::remove`] calls per device. A save that sees a change does not
+    /// keep its file.
+    removed: HashMap<Box<str>, u64>,
 }
 
 impl ArtworkStore {
@@ -48,6 +59,7 @@ impl ArtworkStore {
             inner: Arc::new(Inner {
                 dir,
                 files: Mutex::default(),
+                tmp_seq: AtomicU64::new(0),
             }),
         }
     }
@@ -63,49 +75,60 @@ impl ArtworkStore {
     ) -> io::Result<String> {
         let ext = extension(mime_type.unwrap_or("image/jpeg"));
         let name = format!("{:016x}.{ext}", fnv1a(artwork_id.as_bytes()));
-        if self.touch(device, &name) {
-            return Ok(name);
-        }
+        let removed = {
+            let mut files = self.lock();
+            if touch(&mut files, device, &name) {
+                return Ok(name);
+            }
+            files.removed.get(device).copied().unwrap_or_default()
+        };
         tokio::fs::create_dir_all(&self.inner.dir).await?;
         let path = self.path(device, &name);
-        let tmp = path.with_extension("tmp");
-        tokio::fs::write(&tmp, data).await?;
-        tokio::fs::rename(&tmp, &path).await?;
-        let mut files = self.lock();
-        let list = files.entry(device.into()).or_default();
-        if !list.iter().any(|n| **n == *name) {
-            list.push_back(name.as_str().into());
-            while list.len() > KEEP {
-                if let Some(old) = list.pop_front() {
-                    remove_file(self.path(device, &old));
+        let seq = self.inner.tmp_seq.fetch_add(1, Ordering::Relaxed);
+        let tmp = self.inner.dir.join(format!("{device}-{seq}.tmp"));
+        if let Err(e) = write(&tmp, &path, data).await {
+            remove_files(vec![tmp]);
+            return Err(e);
+        }
+        let mut old = Vec::new();
+        {
+            let mut files = self.lock();
+            if files.removed.get(device).copied().unwrap_or_default() != removed {
+                drop(files);
+                remove_files(vec![path]);
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "device was removed",
+                ));
+            }
+            let list = files.names.entry(device.into()).or_default();
+            if !list.iter().any(|n| **n == *name) {
+                list.push_back(name.as_str().into());
+                while list.len() > KEEP {
+                    if let Some(n) = list.pop_front() {
+                        old.push(self.path(device, &n));
+                    }
                 }
             }
         }
+        remove_files(old);
         Ok(name)
     }
 
     /// Mark the image as used now. False if it is not kept.
     pub fn touch(&self, device: &str, name: &str) -> bool {
-        let mut files = self.lock();
-        let Some(list) = files.get_mut(device) else {
-            return false;
-        };
-        let Some(i) = list.iter().position(|n| **n == *name) else {
-            return false;
-        };
-        if let Some(n) = list.remove(i) {
-            list.push_back(n);
-        }
-        true
+        touch(&mut self.lock(), device, name)
     }
 
     /// Remove all images of a device.
     pub fn remove(&self, device: &str) {
-        let list = self.lock().remove(device);
+        let list = {
+            let mut files = self.lock();
+            *files.removed.entry(device.into()).or_default() += 1;
+            files.names.remove(device)
+        };
         if let Some(list) = list {
-            for name in list {
-                remove_file(self.path(device, &name));
-            }
+            remove_files(list.iter().map(|n| self.path(device, n)).collect());
         }
     }
 
@@ -113,6 +136,7 @@ impl ArtworkStore {
     fn file(&self, device: &str, name: &str) -> Option<PathBuf> {
         let files = self.lock();
         files
+            .names
             .get(device)
             .is_some_and(|l| l.iter().any(|n| **n == *name))
             .then(|| self.path(device, name))
@@ -122,8 +146,8 @@ impl ArtworkStore {
         self.inner.dir.join(format!("{device}-{name}"))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Box<str>, VecDeque<Box<str>>>> {
-        // The map stays valid if a holder panics.
+    fn lock(&self) -> MutexGuard<'_, Files> {
+        // The maps stay valid if a holder panics.
         self.inner
             .files
             .lock()
@@ -131,11 +155,35 @@ impl ArtworkStore {
     }
 }
 
-fn remove_file(path: PathBuf) {
-    if let Err(e) = std::fs::remove_file(&path)
-        && e.kind() != io::ErrorKind::NotFound
-    {
-        warn!("Could not remove {}: {e}", path.display());
+fn touch(files: &mut Files, device: &str, name: &str) -> bool {
+    let Some(list) = files.names.get_mut(device) else {
+        return false;
+    };
+    let Some(i) = list.iter().position(|n| **n == *name) else {
+        return false;
+    };
+    if let Some(n) = list.remove(i) {
+        list.push_back(n);
+    }
+    true
+}
+
+async fn write(tmp: &Path, path: &Path, data: &[u8]) -> io::Result<()> {
+    tokio::fs::write(tmp, data).await?;
+    tokio::fs::rename(tmp, path).await
+}
+
+/// Delete the files. Call it without the lock.
+///
+/// The delete is done before this returns, so a later save of the same name cannot be deleted
+/// by it. Deleting a file is fast.
+fn remove_files(paths: Vec<PathBuf>) {
+    for path in paths {
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            warn!("Could not remove {}: {e}", path.display());
+        }
     }
 }
 

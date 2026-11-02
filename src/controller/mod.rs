@@ -31,7 +31,7 @@ use uc_api::intg::{DeviceState, IntegrationDriverUpdate};
 use uc_api::ws::{EventCategory, WsMessage};
 
 state_machine! {
-    #[derive(Debug)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub operation_mode(RequireSetup)
 
     RequireSetup => {
@@ -56,6 +56,7 @@ state_machine! {
         AbortSetup => RequireSetup [CancelSetupFlowTimer],
     },
     SetupError => {
+        ConfigurationAvailable => Running,
         AbortSetup => RequireSetup,
         SetupDriverRequest => SetupFlow [SetupFlowTimer],
         SetupError => SetupError,
@@ -93,7 +94,7 @@ impl R2Session {
 /// Central controller handling the Integration-API messages.
 pub struct Controller {
     /// Connected Remotes.
-    sessions: HashMap<String, R2Session>,
+    sessions: HashMap<Arc<str>, R2Session>,
     /// Driver state reported to the Remote. Apple TV availability is shown with the entity states.
     device_state: DeviceState,
     drv_metadata: IntegrationDriverUpdate,
@@ -103,6 +104,10 @@ pub struct Controller {
     setup_timeout: Option<SpawnHandle>,
     /// State of the active setup flow.
     setup: Option<SetupState>,
+    /// Session that started the active setup flow.
+    setup_owner: Option<Arc<str>>,
+    /// Id of the setup flow. Changes on each start and end, so that old setup tasks are ignored.
+    setup_flow: u32,
     store: ConfigStore,
     device_ctx: Arc<DeviceContext>,
     /// Configured Apple TVs by device key.
@@ -139,6 +144,8 @@ impl Controller {
             machine: operation_mode::StateMachine::new(),
             setup_timeout: None,
             setup: None,
+            setup_owner: None,
+            setup_flow: 0,
             store,
             device_ctx,
             devices: HashMap::default(),
@@ -180,12 +187,12 @@ impl Controller {
         input: &operation_mode::Input,
         ctx: &mut Context<Self>,
     ) -> Result<(), ServiceError> {
-        let old_state = format!("{:?}", self.machine.state());
+        let old_state = self.machine.state().clone();
         match self.machine.consume(input) {
             Ok(output) => {
-                let state = format!("{:?}", self.machine.state());
-                if state != old_state {
-                    info!("State machine transition: {old_state} -> {state}");
+                let state = self.machine.state();
+                if *state != old_state {
+                    info!("State machine transition: {old_state:?} -> {state:?}");
                 }
                 match output {
                     Some(operation_mode::Output::SetupFlowTimer) => {
@@ -213,7 +220,7 @@ impl Controller {
                 Ok(())
             }
             Err(_) => Err(ServiceError::BadRequest(format!(
-                "Transition {input:?} not allowed in state {old_state}"
+                "Transition {input:?} not allowed in state {old_state:?}"
             ))),
         }
     }

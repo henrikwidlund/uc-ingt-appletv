@@ -15,6 +15,10 @@ use uc_api::intg::{
 
 /// Highest repeat count of a command.
 const MAX_REPEAT: u64 = 20;
+/// Longest hold time of a key in milliseconds. The device command lock is held for this time.
+const MAX_HOLD_MS: u64 = 10_000;
+/// Longest pause between commands in milliseconds.
+const MAX_DELAY_MS: u64 = 5_000;
 
 /// Media player commands offered as simple commands of the remote.
 const MEDIA_PLAYER_COMMANDS: &[&str] = &[
@@ -164,7 +168,7 @@ pub fn command(
         IntgRemoteCommand::SendCmd => {
             let command = media_player::param_str(params, "command")?;
             let mut action = map_command(command)?;
-            let hold = param_u64(params, "hold");
+            let hold = param_u64(params, "hold").min(MAX_HOLD_MS);
             if hold > 0
                 && let Some(key) = action.key()
             {
@@ -173,7 +177,7 @@ pub fn command(
             Ok(RemoteRun {
                 actions: vec![action],
                 repeat: repeat(params),
-                delay: Duration::from_millis(param_u64(params, "delay")),
+                delay: delay(params),
             })
         }
         IntgRemoteCommand::SendCmdSequence => {
@@ -194,7 +198,7 @@ pub fn command(
             Ok(RemoteRun {
                 actions,
                 repeat: repeat(params),
-                delay: Duration::from_millis(param_u64(params, "delay")),
+                delay: delay(params),
             })
         }
         IntgRemoteCommand::StopSend => Err(ServiceError::NotSupported(cmd_id.into())),
@@ -221,6 +225,10 @@ fn repeat(params: Option<&Map<String, Value>>) -> u64 {
         0 | 4 => 1,
         r => r.min(MAX_REPEAT),
     }
+}
+
+fn delay(params: Option<&Map<String, Value>>) -> Duration {
+    Duration::from_millis(param_u64(params, "delay").min(MAX_DELAY_MS))
 }
 
 fn param_u64(params: Option<&Map<String, Value>>, name: &str) -> u64 {
@@ -275,6 +283,24 @@ mod tests {
         let p = params(json!({ "command": "CONTEXT_MENU" }));
         let run = command("send_cmd", Some(&p)).expect("ok");
         assert_eq!(vec![Action::ContextMenu], run.actions);
+    }
+
+    #[test]
+    fn hold_and_delay_are_limited() {
+        let p = params(json!({ "command": "CURSOR_ENTER", "hold": u64::MAX, "delay": "999999" }));
+        let run = command("send_cmd", Some(&p)).expect("ok");
+        assert_eq!(
+            vec![Action::Hold(
+                Key::Select,
+                Duration::from_millis(MAX_HOLD_MS)
+            )],
+            run.actions
+        );
+        assert_eq!(Duration::from_millis(MAX_DELAY_MS), run.delay);
+
+        let p = params(json!({ "sequence": ["HOME"], "delay": 60_000 }));
+        let run = command("send_cmd_sequence", Some(&p)).expect("ok");
+        assert_eq!(Duration::from_millis(MAX_DELAY_MS), run.delay);
     }
 
     #[test]

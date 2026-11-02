@@ -125,6 +125,30 @@ PY
     start_driver
 }
 
+break_config() {
+    # Make config.json invalid, start the driver, then put the file back.
+    if [[ "$IDE" = 1 ]]; then
+        read -r -p "Stop the driver in RustRover now, then press Enter: " _
+    else
+        stop_driver
+    fi
+    cp "$CONFIG_DIR/config.json" "$CONFIG_DIR/config.json.before-broken-test"
+    printf '[{"broken": ' >"$CONFIG_DIR/config.json"
+    start_driver
+    sleep 3
+    recent_log 'Invalid|moved|WARN|ERROR'
+    ls -l "$CONFIG_DIR"/config.json*
+    if [[ "$IDE" = 1 ]]; then
+        read -r -p "Stop the driver in RustRover now, then press Enter: " _
+    else
+        stop_driver
+    fi
+    mv "$CONFIG_DIR/config.json.before-broken-test" "$CONFIG_DIR/config.json"
+    rm -f "$CONFIG_DIR"/config.json.bad-*
+    echo "config.json is back. The moved file was deleted."
+    start_driver
+}
+
 recent_log() {
     # Log lines of the driver from this run, without the HTTP server lines.
     if [[ -z "$LOG" ]] || [[ ! -f "$LOG" ]]; then
@@ -591,6 +615,91 @@ Then press Enter here to show the log." \
 "Setup ends with success. The log shows 'linked to' and then 'connected'.
 The entities are available again with the same entity ids (activities still work)." \
 "recent_log 'linked to|configuration changed|connected|not found|WARN|ERROR' 20"
+
+# ---------------------------------------------------------------- error cases
+
+step "Setup: invalid IP address" \
+"The driver runs. The Apple TV is configured." \
+"Start the setup of the integration again (reconfigure). Choose 'Add a new device'. Press Next.
+In 'IP address', type: appletv.local . Press Next.
+Then press Enter here to show the log." \
+"The same page is shown again with an error. The setup does not hang.
+The log shows 'invalid setup input'.
+Then cancel the setup." \
+"recent_log 'invalid setup input|setup flow|WARN|ERROR'"
+
+step "Setup: empty PIN" \
+"The driver runs. The Apple TV is on." \
+"Start the setup again (reconfigure). Choose the device and 'Pair selected device again'. Press Next.
+When the PIN page shows, type one space as the PIN and press Next.
+Then enter the PIN from the TV and press Next.
+Then press Enter here to show the log." \
+"The space (an empty PIN) shows the PIN page again with an error.
+The real PIN ends the setup with success. The log shows 'connected' after it." \
+"recent_log 'invalid setup input|setup flow|connected|WARN|ERROR' 20"
+
+step "Commands after a canceled setup" \
+"The driver runs and the Apple TV is connected." \
+"Start the setup again (reconfigure). On the first page, cancel the setup.
+Then use the D-pad and Home of the Apple TV entity right away." \
+"The Apple TV reacts. No 'setup required' errors in the log." \
+"recent_log 'setup|WARN|ERROR'"
+
+step "Power toggle pressed twice fast" \
+"The Apple TV is on." \
+"Press the power button of the media player entity two times, fast (within 1 s).
+Wait 10 s. Then press Enter here to show the log." \
+"The Apple TV goes to sleep and wakes up again (it ends on).
+The log shows 'toggle -> [TurnOff]' and then 'toggle -> [TurnOn]'." \
+"recent_log 'toggle ->|WARN|ERROR'"
+
+step "Siri two times in a row" \
+"The Apple TV is on." \
+"Hold the voice button and say: What is the weather. Release it.
+Right away, hold it again and say: Open Settings. Release it.
+Then press Enter here to show the log." \
+"Both commands work. The log has no 'Siri failed' line (for example SiriActive)." \
+"recent_log 'Siri|WARN|ERROR'"
+
+step "Chapter select during playback" \
+"A video with chapters plays (for example a movie in the Apple TV app)." \
+"Watch the chapter select in the web configurator while the video plays.
+Seek over a chapter start." \
+"The current chapter changes at the chapter start and after the seek.
+The chapter list stays the same." \
+"recent_log 'WARN|ERROR'"
+
+step "Reconnect backoff" \
+"The Apple TV is connected." \
+"Restart the Apple TV: Settings > System > Restart. Wait until it is on again (about 1 min).
+Then press Enter here to show the log." \
+"The log shows 'reconnect in' with longer waits while the Apple TV is off (2s, 4s, 6s ...),
+then 'connected'. The entities are available again." \
+"recent_log 'reconnect in|connected|closed|not found|WARN|ERROR' 25"
+
+step "Configuration file after saving" \
+"Step 'Setup: empty PIN' is done (it saved the configuration)." \
+"Press Enter to show the configuration files." \
+"config.json has the mode -rw------- (only the owner can read it).
+There is no config.json.tmp file left." \
+"ls -l \"$CONFIG_DIR\"/config.json* \"$CONFIG_DIR\"/*.tmp 2>/dev/null"
+
+step "Broken configuration file" \
+"The driver runs." \
+"Press Enter. The script stops the driver, makes config.json invalid and starts the driver.
+It then shows the log, puts the old config.json back and starts the driver again." \
+"The log shows 'Invalid ... The file was moved to ...config.json.bad-<time>'.
+The file list shows config.json.bad-<time>. The driver starts with no devices.
+After the restore, the Apple TV connects again (check that the entities are available)." \
+"break_config"
+
+step "Check the log for errors again" \
+"The steps above are done." \
+"Press Enter to show warnings and errors from the driver log." \
+"Each WARN or ERROR line is about a step above where something did not work.
+The broken configuration step gives one expected ERROR line.
+In the note: copy lines that you cannot connect to a step." \
+"recent_log 'WARN|ERROR' 40"
 
 save "" "Done."
 echo

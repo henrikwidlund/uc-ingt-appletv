@@ -11,16 +11,31 @@ use crate::device::{
 use crate::entities::{self, Capabilities, EntityKind};
 use crate::errors::ServiceError;
 use crate::util::{DeserializeMsgData, return_fut_err};
-use actix::{Actor, Addr, AsyncContext, Context, Handler, ResponseFuture};
+use actix::{Actor, Addr, AsyncContext, Context, Handler, Message, ResponseFuture};
 use log::{debug, info, warn};
-use serde_json::{Map, Value};
+use serde::Serialize;
+use serde_json::{Map, Value, json};
 use std::sync::Arc;
+use uc_api::EntityType;
 use uc_api::intg::ws::BrowseMediaMsgData;
-use uc_api::intg::{AssistantEvent, AvailableIntgEntity, DeviceState, EntityChange, EntityCommand};
+use uc_api::intg::{AssistantEvent, AvailableIntgEntity, DeviceState, EntityCommand};
 use uc_api::ws::{EventCategory, WsMessage, WsResultMsgData};
 
 /// Attribute that changes with each position update.
 const POSITION_UPDATED_AT: &str = "media_position_updated_at";
+
+/// `entity_change` data. Borrows the attributes, so that they are not copied to serialize them.
+#[derive(Serialize)]
+pub(super) struct EntityChangeRef<'a> {
+    entity_type: EntityType,
+    entity_id: &'a str,
+    attributes: &'a Map<String, Value>,
+}
+
+/// A voice command failed: forget the voice session.
+#[derive(Message)]
+#[rtype(result = "()")]
+struct EndVoiceSession(u32);
 
 /// One configured Apple TV.
 pub(super) struct Device {
@@ -35,12 +50,17 @@ impl Controller {
     pub(super) fn add_device(&mut self, cfg: DeviceConfig, ctx: &Context<Self>) {
         let key: Arc<str> = cfg.key.as_str().into();
         let addr = AppleTvActor::new(
+            key.clone(),
             cfg.clone(),
             self.device_ctx.clone(),
             ctx.address().recipient(),
         )
         .start();
-        if let Some(old) = self.devices.insert(
+        // Remove first: `insert` keeps the old key, and events are matched by the key instance.
+        if let Some(old) = self.devices.remove(&*key) {
+            old.addr.do_send(Stop);
+        }
+        self.devices.insert(
             key,
             Device {
                 cfg,
@@ -48,9 +68,14 @@ impl Controller {
                 caps: Capabilities::default(),
                 status: DeviceStatus::Disconnected,
             },
-        ) {
-            old.addr.do_send(Stop);
-        }
+        );
+    }
+
+    /// True if the key belongs to the running actor of the device.
+    fn is_current(&self, key: &Arc<str>) -> bool {
+        self.devices
+            .get_key_value(&**key)
+            .is_some_and(|(k, _)| Arc::ptr_eq(k, key))
     }
 
     /// Stop the actor of a device and forget its entities.
@@ -61,6 +86,8 @@ impl Controller {
             .retain(|id, _| EntityKind::parse(id).is_none_or(|(k, _)| k != key));
         self.voice_sessions.retain(|_, k| &**k != key);
         self.store.remove_cache(key);
+        // The removed device might have had an error.
+        self.update_device_state();
         Some(device.cfg)
     }
 
@@ -80,12 +107,12 @@ impl Controller {
     }
 
     /// States of the subscribed entities, or of all entities without subscriptions.
-    pub(super) fn entity_states(&self, ws_id: &str) -> Vec<EntityChange> {
+    pub(super) fn entity_states(&self, ws_id: &str) -> Vec<EntityChangeRef<'_>> {
         let subscribed = self.sessions.get(ws_id).map(|s| &s.subscribed_entities);
         self.entities
             .iter()
             .filter(|(id, _)| subscribed.is_none_or(|s| s.is_empty() || s.contains(*id)))
-            .filter_map(|(id, attrs)| entity_change(id, attrs.clone()))
+            .filter_map(|(id, attrs)| entity_change(id, attrs))
             .collect()
     }
 
@@ -101,11 +128,7 @@ impl Controller {
         }
         // Send the current states, and connect the devices.
         for id in &new {
-            if let Some(change) = self
-                .entities
-                .get(id)
-                .and_then(|a| entity_change(id, a.clone()))
-            {
+            if let Some(change) = self.entities.get(id).and_then(|a| entity_change(id, a)) {
                 self.send_entity_change(ws_id, &change);
             }
             if let Some((key, _)) = EntityKind::parse(id)
@@ -156,6 +179,7 @@ impl Controller {
         &mut self,
         msg: R2RequestMsg,
         _resp_msg: &'static str,
+        ctx: &Context<Self>,
     ) -> ResponseFuture<Result<Option<WsMessage>, ServiceError>> {
         let req_id = msg.req_id;
         let command: EntityCommand = match msg.deserialize() {
@@ -173,14 +197,23 @@ impl Controller {
                 command.entity_id
             )));
         }
-        self.voice_session(&command);
+        let voice_session = self.voice_session(&command);
+        let controller = ctx.address();
         Box::pin(async move {
-            addr.send(Command {
-                kind,
-                cmd_id: command.cmd_id,
-                params: command.params,
-            })
-            .await??;
+            let result = addr
+                .send(Command {
+                    kind,
+                    cmd_id: command.cmd_id,
+                    params: command.params,
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.into()));
+            if let Err(e) = result {
+                if let Some(session_id) = voice_session {
+                    controller.do_send(EndVoiceSession(session_id));
+                }
+                return Err(e);
+            }
             Ok(Some(WsMessage::response(
                 req_id,
                 "result",
@@ -232,7 +265,7 @@ impl Controller {
         Ok((device.addr.clone(), kind))
     }
 
-    fn send_entity_change(&self, ws_id: &str, change: &EntityChange) {
+    fn send_entity_change(&self, ws_id: &str, change: &EntityChangeRef<'_>) {
         match serde_json::to_value(change) {
             Ok(data) => self.send_r2_msg(
                 WsMessage::event("entity_change", EventCategory::Entity, data),
@@ -251,44 +284,62 @@ impl Controller {
 
     /// Store changed attributes and send them to the subscribed Remotes.
     fn apply_changes(&mut self, key: &str, updates: Vec<(EntityKind, Map<String, Value>)>) {
+        // Late event of a removed device.
+        if !self.devices.contains_key(key) {
+            return;
+        }
+        let mut entity_id = String::new();
         for (kind, attrs) in updates {
-            let entity_id = kind.entity_id(key);
+            entity_id.clear();
+            kind.write_entity_id(key, &mut entity_id);
+            let subscribed = self
+                .sessions
+                .values()
+                .any(|s| s.subscribed_entities.contains(&entity_id));
             let changed = if let Some(cache) = self.entities.get_mut(&entity_id) {
-                diff(cache, attrs)
+                diff(cache, attrs, subscribed)
             } else {
-                self.entities.insert(entity_id.clone(), attrs.clone());
-                attrs
+                let changed = if subscribed {
+                    attrs.clone()
+                } else {
+                    Map::new()
+                };
+                self.entities.insert(entity_id.clone(), attrs);
+                changed
             };
-            if changed.is_empty()
-                || !self
-                    .sessions
-                    .values()
-                    .any(|s| s.subscribed_entities.contains(&entity_id))
-            {
-                continue;
-            }
-            let change = EntityChange {
-                device_id: None,
-                entity_type: kind.entity_type(),
-                entity_id,
-                attributes: changed,
-            };
-            let data = match serde_json::to_value(&change) {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!("entity_change serialize error: {e}");
-                    continue;
-                }
-            };
-            for (ws_id, session) in &self.sessions {
-                if session.subscribed_entities.contains(&change.entity_id) {
-                    self.send_r2_msg(
-                        WsMessage::event("entity_change", EventCategory::Entity, data.clone()),
-                        ws_id,
-                    );
-                }
+            if !changed.is_empty() {
+                self.send_changes(kind, &entity_id, changed);
             }
         }
+    }
+
+    /// Send `entity_change` to the Remotes that subscribed the entity.
+    fn send_changes(&self, kind: EntityKind, entity_id: &str, attributes: Map<String, Value>) {
+        let mut targets = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.subscribed_entities.contains(entity_id))
+            .map(|(ws_id, _)| &**ws_id);
+        let Some(mut target) = targets.next() else {
+            return;
+        };
+        let mut data = Map::new();
+        data.insert("entity_type".into(), json!(kind.entity_type()));
+        data.insert("entity_id".into(), entity_id.into());
+        data.insert("attributes".into(), Value::Object(attributes));
+        let data = Value::Object(data);
+        // The data is only copied for more than one Remote.
+        for next in targets {
+            self.send_r2_msg(
+                WsMessage::event("entity_change", EventCategory::Entity, data.clone()),
+                target,
+            );
+            target = next;
+        }
+        self.send_r2_msg(
+            WsMessage::event("entity_change", EventCategory::Entity, data),
+            target,
+        );
     }
 
     /// Driver state: error while one device has invalid credentials.
@@ -311,36 +362,50 @@ impl Controller {
     }
 }
 
-/// Merge new attributes into the cache. Returns the attributes that changed.
-fn diff(cache: &mut Map<String, Value>, attrs: Map<String, Value>) -> Map<String, Value> {
+/// Merge new attributes into the cache. Returns the attributes that changed if `collect` is set.
+fn diff(
+    cache: &mut Map<String, Value>,
+    attrs: Map<String, Value>,
+    collect: bool,
+) -> Map<String, Value> {
     let mut changed = Map::new();
     let mut updated_at = None;
+    let mut new_position = false;
     for (name, value) in attrs {
         if name == POSITION_UPDATED_AT {
             updated_at = Some(value);
             continue;
         }
         if cache.get(&name) != Some(&value) {
-            cache.insert(name.clone(), value.clone());
-            changed.insert(name, value);
+            new_position |= name == "media_position" || name == "media_duration";
+            if collect {
+                cache.insert(name.clone(), value.clone());
+                changed.insert(name, value);
+            } else {
+                cache.insert(name, value);
+            }
         }
     }
     // The timestamp is only sent with a new position.
     if let Some(ts) = updated_at
-        && (changed.contains_key("media_position") || changed.contains_key("media_duration"))
+        && new_position
     {
-        cache.insert(POSITION_UPDATED_AT.into(), ts.clone());
-        changed.insert(POSITION_UPDATED_AT.into(), ts);
+        if collect {
+            changed.insert(POSITION_UPDATED_AT.into(), ts.clone());
+        }
+        cache.insert(POSITION_UPDATED_AT.into(), ts);
     }
     changed
 }
 
-fn entity_change(entity_id: &str, attributes: Map<String, Value>) -> Option<EntityChange> {
+fn entity_change<'a>(
+    entity_id: &'a str,
+    attributes: &'a Map<String, Value>,
+) -> Option<EntityChangeRef<'a>> {
     let (_, kind) = EntityKind::parse(entity_id)?;
-    Some(EntityChange {
-        device_id: None,
+    Some(EntityChangeRef {
         entity_type: kind.entity_type(),
-        entity_id: entity_id.to_string(),
+        entity_id,
         attributes,
     })
 }
@@ -349,6 +414,15 @@ impl Handler<DeviceEvent> for Controller {
     type Result = ();
 
     fn handle(&mut self, msg: DeviceEvent, _: &mut Self::Context) {
+        if let DeviceEvent::Changes { key, .. }
+        | DeviceEvent::Capabilities { key, .. }
+        | DeviceEvent::Config { key, .. }
+        | DeviceEvent::Status { key, .. } = &msg
+            && !self.is_current(key)
+        {
+            // From a removed or replaced actor.
+            return;
+        }
         match msg {
             DeviceEvent::Changes { key, changes } => self.apply_changes(&key, changes),
             DeviceEvent::Capabilities { key, caps } => {
@@ -362,12 +436,24 @@ impl Handler<DeviceEvent> for Controller {
                     Err(e) => warn!("entity_available serialize error: {e}"),
                 }
             }
-            DeviceEvent::Config(cfg) => {
-                let Some(device) = self.devices.get_mut(cfg.key.as_str()) else {
+            DeviceEvent::Config { key, cfg } => {
+                let Some(device) = self.devices.get_mut(&*key) else {
                     return;
                 };
+                // Only take the values the device finds on the network. The event can be older
+                // than the credentials and settings of the controller, for example after pairing
+                // again.
+                let own = &mut device.cfg;
+                let address = !own.manual_address && own.address != cfg.address;
+                if own.name == cfg.name && own.known_ids == cfg.known_ids && !address {
+                    return;
+                }
                 info!("[{}] saving changed configuration", cfg.name);
-                device.cfg = cfg;
+                own.name = cfg.name;
+                own.known_ids = cfg.known_ids;
+                if address {
+                    own.address = cfg.address;
+                }
                 if let Err(e) = self.save_devices() {
                     warn!("Saving the configuration failed: {e}");
                 }
@@ -411,11 +497,19 @@ impl Handler<R2AudioChunkMsg> for Controller {
     }
 }
 
+impl Handler<EndVoiceSession> for Controller {
+    type Result = ();
+
+    fn handle(&mut self, msg: EndVoiceSession, _: &mut Self::Context) {
+        self.voice_sessions.remove(&msg.0);
+    }
+}
+
 impl Controller {
-    /// Remember the device of a voice session, for the audio chunks.
-    pub(super) fn voice_session(&mut self, command: &EntityCommand) {
-        if command.entity_type != uc_api::EntityType::VoiceAssistant {
-            return;
+    /// Remember the device of a voice session, for the audio chunks. Returns the session id.
+    pub(super) fn voice_session(&mut self, command: &EntityCommand) -> Option<u32> {
+        if command.entity_type != EntityType::VoiceAssistant {
+            return None;
         }
         let session_id = command
             .params
@@ -428,14 +522,15 @@ impl Controller {
             && let Some((key, _)) = self.devices.get_key_value(key)
         {
             self.voice_sessions.insert(session_id, key.clone());
+            return Some(session_id);
         }
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     fn map(v: Value) -> Map<String, Value> {
         v.as_object().cloned().expect("object")
@@ -447,6 +542,7 @@ mod tests {
         let changed = diff(
             &mut cache,
             map(json!({ "state": "ON", "media_title": "Song" })),
+            true,
         );
         assert_eq!(map(json!({ "media_title": "Song" })), changed);
         assert_eq!(Some(&json!("Song")), cache.get("media_title"));
@@ -458,15 +554,32 @@ mod tests {
         let changed = diff(
             &mut cache,
             map(json!({ "media_position": 1, POSITION_UPDATED_AT: "t1" })),
+            true,
         );
         assert!(changed.is_empty());
         let changed = diff(
             &mut cache,
             map(json!({ "media_position": 2, POSITION_UPDATED_AT: "t2" })),
+            true,
         );
         assert_eq!(
             map(json!({ "media_position": 2, POSITION_UPDATED_AT: "t2" })),
             changed
+        );
+    }
+
+    #[test]
+    fn diff_without_collect_updates_cache_only() {
+        let mut cache = map(json!({ "media_position": 1 }));
+        let changed = diff(
+            &mut cache,
+            map(json!({ "media_position": 2, POSITION_UPDATED_AT: "t2" })),
+            false,
+        );
+        assert!(changed.is_empty());
+        assert_eq!(
+            map(json!({ "media_position": 2, POSITION_UPDATED_AT: "t2" })),
+            cache
         );
     }
 }

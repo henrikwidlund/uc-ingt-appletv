@@ -66,7 +66,10 @@ pub enum DeviceEvent {
         caps: Capabilities,
     },
     /// The configuration changed and must be saved.
-    Config(DeviceConfig),
+    Config {
+        key: Arc<str>,
+        cfg: DeviceConfig,
+    },
     Status {
         key: Arc<str>,
         status: DeviceStatus,

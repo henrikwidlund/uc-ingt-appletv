@@ -4,8 +4,10 @@
 //! Actor for one Apple TV: connection, state updates and commands.
 
 use crate::config_store::{DeviceConfig, fnv1a};
-use crate::device::commands::{Call, Planner, Seek, exec};
-use crate::device::state::{ARTWORK_SIZE, AccountInfo, AppInfo, Dirty, ItemArtwork, Snapshot};
+use crate::device::commands::{Call, Planner, Seek, exec_all};
+use crate::device::state::{
+    ARTWORK_SIZE, AccountInfo, AppInfo, Dirty, ItemArtwork, Power, Snapshot,
+};
 use crate::device::{
     AudioChunk, Browse, Command, Connect, DeviceContext, DeviceEvent, DeviceStatus, Disconnect,
     Stop, UpdateConfig, browse, discovery, now,
@@ -23,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::BroadcastStream;
@@ -30,13 +33,19 @@ use uc_api::intg::{AssistantError, AssistantErrorCode, AssistantEvent};
 
 /// Interval for the app, account and AirPlay polls.
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
+/// The app list time is taken at the reply, so the next poll comes a bit early.
+const APPS_MARGIN: Duration = Duration::from_secs(30);
 /// Interval for a full reconnect while a protocol is missing.
 const FULL_RECONNECT_INTERVAL: Duration = Duration::from_secs(600);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// A connection that stayed up this long resets the reconnect delay.
+const STABLE_CONNECTION: Duration = Duration::from_secs(60);
 /// Siri ends if no audio arrives in this time.
 const SIRI_AUDIO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Audio chunks kept while Siri starts.
 const SIRI_QUEUE: usize = 256;
+/// Longest wait for the session before to end.
+const SIRI_WAIT: Duration = Duration::from_secs(15);
 /// Screen events come in bursts. Act after the last one.
 const SCREEN_SETTLE: Duration = Duration::from_millis(1500);
 /// Now playing changes right after the Home Screen shows belong to the switch.
@@ -70,6 +79,8 @@ struct CompanionEvent {
 struct SiriSession {
     session_id: u32,
     audio: mpsc::Sender<Bytes>,
+    /// Set when a newer session replaces this one.
+    replaced: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -95,6 +106,10 @@ pub struct AppleTvActor {
     /// The controller wants a connection.
     want: bool,
     attempts: u32,
+    /// Incremented on each connect attempt and on close. Results of older attempts are ignored.
+    attempt: u64,
+    /// Time of the last successful connect.
+    connected_at: Option<Instant>,
     /// Incremented on each connect and disconnect. Results of older connections are ignored.
     generation: u64,
     np: Option<watch::Receiver<NowPlaying>>,
@@ -102,10 +117,14 @@ pub struct AppleTvActor {
     attention: Option<AttentionState>,
     seek: Option<Seek>,
     siri: Option<SiriSession>,
+    /// Held while a Siri session exists on the device.
+    siri_lock: Arc<tokio::sync::Mutex<()>>,
     /// Commands run one after the other.
     cmd_lock: Arc<tokio::sync::Mutex<()>>,
     timers: Timers,
     apps_fetched: Option<Instant>,
+    /// Last sent current chapter.
+    chapter: Option<usize>,
     /// Incremented on each artwork update. Results of older fetches are ignored.
     artwork_seq: u64,
     /// The Home Screen shows: now playing is cleared since then.
@@ -117,10 +136,17 @@ pub struct AppleTvActor {
     /// Name of the shown artwork file.
     shown_file: Option<Box<str>>,
     item_art: ItemArtwork,
+    /// Cached result of [`Self::find_http_base`]. Reset on close.
+    http_base: Option<String>,
+    /// Mute and power set by the last commands. Used for toggles until the device reports them.
+    expected_mute: Option<bool>,
+    expected_power: Option<Power>,
 }
 
 impl AppleTvActor {
+    /// `key` is shared with the controller, which uses it to tell this actor from an older one.
     pub fn new(
+        key: Arc<str>,
         cfg: DeviceConfig,
         ctx: Arc<DeviceContext>,
         controller: Recipient<DeviceEvent>,
@@ -134,7 +160,7 @@ impl AppleTvActor {
         s.set_apps(cache.apps);
         s.set_airplay_devices(cache.airplay_devices);
         Self {
-            key: cfg.key.as_str().into(),
+            key,
             cfg,
             cfg_version: 0,
             ctx,
@@ -145,30 +171,50 @@ impl AppleTvActor {
             status: DeviceStatus::Disconnected,
             want: false,
             attempts: 0,
+            attempt: 0,
+            connected_at: None,
             generation: 0,
             np: None,
             volume: None,
             attention: None,
             seek: None,
             siri: None,
+            siri_lock: Arc::default(),
             artwork_seq: 0,
             home_since: None,
             launched_at: None,
             media_flags: None,
             shown_file: None,
             item_art: ItemArtwork::default(),
+            http_base: None,
+            expected_mute: None,
+            expected_power: None,
             cmd_lock: Arc::default(),
             timers: Timers::default(),
             apps_fetched: None,
+            chapter: None,
         }
     }
 
     /// Send the attributes of the dirty groups to the controller.
-    fn emit(&self, dirty: Dirty) {
+    fn emit(&mut self, mut dirty: Dirty) {
+        let now = now();
+        if dirty.any(
+            Dirty::CONNECTION
+                | Dirty::POSITION
+                | Dirty::PLAYBACK
+                | Dirty::CHAPTERS
+                | Dirty::CHAPTER,
+        ) {
+            let chapter = self.s.current_chapter(now);
+            if chapter != self.chapter {
+                self.chapter = chapter;
+                dirty |= Dirty::CHAPTER;
+            }
+        }
         if dirty.is_empty() {
             return;
         }
-        let now = now();
         let changes: Vec<_> = EntityKind::all()
             .filter_map(|kind| {
                 let mut attrs = Map::new();
@@ -194,6 +240,23 @@ impl AppleTvActor {
         }
     }
 
+    /// Use a new configuration. A new name is shown in the output names.
+    fn set_config(&mut self, cfg: DeviceConfig) {
+        let mut dirty = Dirty::NONE;
+        if cfg.name != self.cfg.name {
+            dirty |= self.s.set_name(&cfg.name);
+        }
+        if cfg.global_volume != self.cfg.global_volume {
+            self.s.global_volume = cfg.global_volume;
+            dirty |= Dirty::VOLUME;
+        }
+        if cfg.address != self.cfg.address {
+            self.http_base = None;
+        }
+        self.cfg = cfg;
+        self.emit(dirty);
+    }
+
     fn connect(&mut self, ctx: &mut Context<Self>) {
         if !self.want
             || matches!(
@@ -204,6 +267,8 @@ impl AppleTvActor {
             return;
         }
         self.set_status(DeviceStatus::Connecting);
+        self.attempt += 1;
+        let attempt = self.attempt;
         let mut cfg = self.cfg.clone();
         let version = self.cfg_version;
         let mut options = ClientOptions::default();
@@ -221,11 +286,27 @@ impl AppleTvActor {
             (changed.then_some(cfg), result.map_err(Some))
         };
         ctx.spawn(fut.into_actor(self).map(move |(cfg, result), act, ctx| {
+            // What discovery found is valid also for an old attempt.
             if let Some(cfg) = cfg
                 && act.cfg_version == version
             {
-                act.cfg = cfg.clone();
-                act.controller.do_send(DeviceEvent::Config(cfg));
+                act.set_config(cfg.clone());
+                act.controller.do_send(DeviceEvent::Config {
+                    key: act.key.clone(),
+                    cfg,
+                });
+            }
+            if act.attempt != attempt {
+                debug!(
+                    "[{}] result of an old connect attempt ignored",
+                    act.cfg.name
+                );
+                if let Ok(tv) = result {
+                    actix::spawn(async move {
+                        let _ = tv.close().await;
+                    });
+                }
+                return;
             }
             match result {
                 Ok(tv) if act.want && act.status == DeviceStatus::Connecting => {
@@ -259,7 +340,7 @@ impl AppleTvActor {
     fn on_connected(&mut self, tv: AppleTv, ctx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
-        self.attempts = 0;
+        self.connected_at = Some(Instant::now());
         info!("[{}] connected", self.cfg.name);
 
         let missing = match (tv.companion().is_some(), tv.mrp().is_some()) {
@@ -338,6 +419,15 @@ impl AppleTvActor {
     /// Close the connection and stop all tasks of it.
     fn close(&mut self, ctx: &mut Context<Self>) {
         self.generation += 1;
+        self.attempt += 1;
+        // A connection that drops at once keeps the reconnect delay growing.
+        if self
+            .connected_at
+            .take()
+            .is_some_and(|t| t.elapsed() >= STABLE_CONNECTION)
+        {
+            self.attempts = 0;
+        }
         self.np = None;
         self.volume = None;
         self.attention = None;
@@ -345,6 +435,9 @@ impl AppleTvActor {
         self.siri = None;
         self.home_since = None;
         self.media_flags = None;
+        self.http_base = None;
+        self.expected_mute = None;
+        self.expected_power = None;
         for handle in [
             self.timers.poll.take(),
             self.timers.chapter.take(),
@@ -424,6 +517,7 @@ impl AppleTvActor {
 
     fn set_attention(&mut self, state: AttentionState) {
         self.attention = Some(state);
+        self.expected_power = None;
         let dirty = self.s.set_power(state.into());
         self.emit(dirty);
     }
@@ -667,7 +761,10 @@ impl AppleTvActor {
 
     /// Show a kept artwork file.
     fn show_file(&mut self, name: Box<str>, item: u32) {
-        let Some(base) = self.http_base() else {
+        if self.http_base.is_none() {
+            self.http_base = self.find_http_base();
+        }
+        let Some(base) = &self.http_base else {
             warn!("[{}] no local address for the artwork URL", self.cfg.name);
             return;
         };
@@ -687,7 +784,7 @@ impl AppleTvActor {
     }
 
     /// Base URL of the HTTP server, with an address on the network of the Apple TV.
-    fn http_base(&self) -> Option<String> {
+    fn find_http_base(&self) -> Option<String> {
         let ip = self.ctx.http_address.or_else(|| {
             // No packet is sent: connect only selects the local address.
             let target = SocketAddr::new(self.cfg.address?, 9);
@@ -722,10 +819,12 @@ impl AppleTvActor {
         else {
             return;
         };
-        let delay = Duration::from_secs_f64(((next - pos) / rate).max(0.5));
+        let Some(delay) = chapter_delay(next - pos, rate) else {
+            return;
+        };
         self.timers.chapter = Some(ctx.run_later(delay, |act, ctx| {
             act.timers.chapter = None;
-            act.emit(Dirty::CHAPTERS);
+            act.emit(Dirty::CHAPTER);
             act.schedule_chapter(ctx);
         }));
     }
@@ -738,7 +837,7 @@ impl AppleTvActor {
         if tv.companion().is_some() {
             if self
                 .apps_fetched
-                .is_none_or(|t| t.elapsed() >= POLL_INTERVAL)
+                .is_none_or(|t| t.elapsed() + APPS_MARGIN >= POLL_INTERVAL)
             {
                 let apps_tv = tv.clone();
                 ctx.spawn(async move { apps_tv.apps().await }.into_actor(self).map(
@@ -842,9 +941,13 @@ impl AppleTvActor {
                 return Err(ServiceError::NotSupported(msg.cmd_id.clone()));
             }
         };
+        // Kept only if the plan succeeds.
+        let mut seek = self.seek;
         let mut planner = Planner {
             s: &self.s,
-            seek: &mut self.seek,
+            seek: &mut seek,
+            power: self.expected_power.unwrap_or(self.s.power),
+            muted: self.expected_mute.or(self.s.muted),
             screensaver: self.attention == Some(AttentionState::Screensaver),
             powered: false,
         };
@@ -857,6 +960,7 @@ impl AppleTvActor {
                 planner.plan(action, &mut calls)?;
             }
         }
+        self.seek = seek;
         Ok(calls)
     }
 
@@ -879,14 +983,29 @@ impl AppleTvActor {
                 "[{}] Siri session {} replaced by {session_id}",
                 self.cfg.name, old.session_id
             );
+            old.replaced.store(true, Ordering::Relaxed);
         }
         let (audio, mut rx) = mpsc::channel::<Bytes>(SIRI_QUEUE);
-        self.siri = Some(SiriSession { session_id, audio });
+        let replaced = Arc::new(AtomicBool::new(false));
+        self.siri = Some(SiriSession {
+            session_id,
+            audio,
+            replaced: replaced.clone(),
+        });
 
         let entity_id = EntityKind::VoiceAssistant.entity_id(&self.key);
         let controller = self.controller.clone();
         let ready_id = entity_id.clone();
+        let lock = self.siri_lock.clone();
         let fut = async move {
+            // ratv allows one session. The session before ends after its audio is sent.
+            let _active = tokio::time::timeout(SIRI_WAIT, lock.lock_owned())
+                .await
+                .map_err(|_| ratv::Error::SiriActive)?;
+            // Replaced while it waited: do not start it.
+            if replaced.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             let mut siri = tv.start_siri().await?;
             controller.do_send(DeviceEvent::Assistant(AssistantEvent::Ready {
                 entity_id: ready_id,
@@ -943,6 +1062,11 @@ impl AppleTvActor {
     }
 }
 
+/// Time until the next chapter, or `None` if it is not a valid duration.
+fn chapter_delay(distance: f64, rate: f64) -> Option<Duration> {
+    Duration::try_from_secs_f64((distance / rate).max(0.5)).ok()
+}
+
 /// Stream that yields `msg` each time the watch value changes.
 fn changes<T: Send + Sync + 'static>(
     rx: watch::Receiver<T>,
@@ -973,7 +1097,10 @@ impl Handler<WatchChanged> for AppleTvActor {
     fn handle(&mut self, msg: WatchChanged, ctx: &mut Self::Context) {
         let dirty = match msg {
             WatchChanged::NowPlaying(g) if g == self.generation => self.update_now_playing(ctx),
-            WatchChanged::Volume(g) if g == self.generation => self.update_volume(),
+            WatchChanged::Volume(g) if g == self.generation => {
+                self.expected_mute = None;
+                self.update_volume()
+            }
             _ => return,
         };
         self.emit(dirty);
@@ -1047,12 +1174,8 @@ impl Handler<UpdateConfig> for AppleTvActor {
         let cfg = msg.0;
         let reconnect = cfg.credentials != self.cfg.credentials
             || cfg.address != self.cfg.address
-            || cfg.known_ids != self.cfg.known_ids;
-        if cfg.global_volume != self.cfg.global_volume {
-            self.s.global_volume = cfg.global_volume;
-            self.emit(Dirty::VOLUME);
-        }
-        self.cfg = cfg;
+            || !discovery::same_ids(&cfg.known_ids, &self.cfg.known_ids);
+        self.set_config(cfg);
         self.cfg_version += 1;
         if reconnect && self.want {
             info!("[{}] configuration changed, reconnecting", self.cfg.name);
@@ -1074,51 +1197,88 @@ impl Handler<Command> for AppleTvActor {
             };
             return Box::pin(fut::ready(result));
         }
-        let Some(tv) = self.tv.clone() else {
+        if self.tv.is_none() {
             return Box::pin(fut::ready(Err(ServiceError::NotConnected)));
-        };
-        let calls = match self.plan(&msg) {
-            Ok(calls) => calls,
-            Err(e) => return Box::pin(fut::ready(Err(e))),
-        };
-        debug!("[{}] {} -> {calls:?}", self.cfg.name, msg.cmd_id);
-        // The current account is not reported by the Apple TV, so it is set after a switch.
-        let account = calls.iter().rev().find_map(|c| match c {
-            Call::SwitchAccount(_, name) => Some(name.clone()),
-            _ => None,
-        });
-        // The app in front is not reported either.
-        let launched = calls.iter().rev().find_map(|c| match c {
-            Call::LaunchApp(id) => Some(id.clone()),
-            _ => None,
-        });
+        }
+        // Plan after the command before has ended, so toggles see its result.
         let lock = self.cmd_lock.clone();
-        let fut = async move {
-            let _guard = lock.lock().await;
-            for call in calls {
-                exec(&tv, call).await?;
-            }
-            Ok(())
-        };
         Box::pin(
-            fut.into_actor(self)
-                .map(move |result: Result<(), ratv::Error>, act, _| {
-                    if result.is_ok()
-                        && let Some(name) = account
-                    {
-                        act.s.current_account = Some(name);
-                        act.emit(Dirty::ACCOUNTS);
-                    }
-                    if result.is_ok()
-                        && let Some(id) = launched
-                    {
-                        act.s.launched_app = Some(id);
-                        act.launched_at = Some(Instant::now());
-                        act.emit(Dirty::APPS);
-                    }
-                    result.map_err(ServiceError::from)
-                }),
+            async move { lock.lock_owned().await }
+                .into_actor(self)
+                .then(move |guard, act, _| act.run_command(&msg, guard)),
         )
+    }
+}
+
+impl AppleTvActor {
+    /// Plan and run a command. `guard` is held until the results are applied.
+    fn run_command(
+        &mut self,
+        msg: &Command,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> impl ActorFuture<Self, Output = Result<(), ServiceError>> + use<> {
+        let generation = self.generation;
+        let prepared = match (self.tv.clone(), self.plan(msg)) {
+            (None, _) => Err(ServiceError::NotConnected),
+            (_, Err(e)) => Err(e),
+            (Some(tv), Ok(calls)) => Ok((tv, calls)),
+        };
+        let mut account = None;
+        let mut launched = None;
+        let mut mute = None;
+        let mut power = None;
+        let mut begins_seek = false;
+        if let Ok((_, calls)) = &prepared {
+            debug!("[{}] {} -> {calls:?}", self.cfg.name, msg.cmd_id);
+            for call in calls {
+                match call {
+                    // The current account is not reported by the Apple TV, so it is set after a switch.
+                    Call::SwitchAccount(_, name) => account = Some(name.clone()),
+                    // The app in front is not reported either.
+                    Call::LaunchApp(id) => launched = Some(id.clone()),
+                    Call::Mute(m) => mute = Some(*m),
+                    Call::TurnOn => power = Some(Power::On),
+                    Call::TurnOff => power = Some(Power::Off),
+                    Call::BeginFastForward | Call::BeginRewind => begins_seek = true,
+                    _ => {}
+                }
+            }
+        }
+        let fut = async move {
+            let result = match prepared {
+                Ok((tv, calls)) => exec_all(&tv, calls).await.map_err(ServiceError::from),
+                Err(e) => Err(e),
+            };
+            (result, guard)
+        };
+        fut.into_actor(self).map(move |(result, _guard), act, _| {
+            let ok = result.is_ok();
+            if act.generation == generation {
+                // After an error the device state is not known.
+                if begins_seek && !ok {
+                    act.seek = None;
+                }
+                if mute.is_some() {
+                    act.expected_mute = mute.filter(|_| ok);
+                }
+                if power.is_some() {
+                    act.expected_power = power.filter(|_| ok);
+                }
+            }
+            if !ok {
+                return result;
+            }
+            if let Some(name) = account {
+                act.s.current_account = Some(name);
+                act.emit(Dirty::ACCOUNTS);
+            }
+            if let Some(id) = launched {
+                act.s.launched_app = Some(id);
+                act.launched_at = Some(Instant::now());
+                act.emit(Dirty::APPS);
+            }
+            result
+        })
     }
 }
 
@@ -1156,5 +1316,18 @@ impl Handler<AudioChunk> for AppleTvActor {
             // Dropping the sender also ends the session if the end marker was dropped.
             self.siri = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chapter_delay_is_valid() {
+        assert_eq!(Some(Duration::from_secs(10)), chapter_delay(20.0, 2.0));
+        assert_eq!(Some(Duration::from_millis(500)), chapter_delay(0.1, 1.0));
+        assert_eq!(None, chapter_delay(f64::INFINITY, 1.0));
+        assert_eq!(None, chapter_delay(1e300, 1e-10));
     }
 }

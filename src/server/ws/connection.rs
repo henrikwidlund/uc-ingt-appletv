@@ -9,23 +9,30 @@ use crate::controller::{
 };
 use crate::errors::ServiceError;
 use crate::server::ws::WsConn;
-use actix::{Actor, ActorFutureExt, AsyncContext, Handler, WrapFuture};
+use actix::{Actor, ActorFutureExt, Addr, AsyncContext, Handler, WrapFuture};
 use actix_ws::{AggregatedMessage, CloseCode, CloseReason, Session};
 use bytes::Bytes;
 use log::{debug, error, info, warn};
 use prost::Message;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::time::timeout;
 use uc_api::intg::proto::{
     AudioFormat, IntegrationMessage, SampleFormat, integration_message::Message as ProtoMsg,
 };
 use uc_api::ws::{WsMessage, WsResultMsgData};
 
+/// Longest wait for a free place in the session queue. The queue is full when the Remote does not
+/// read.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Sends messages from the controller to the WebSocket connection.
 ///
 /// Messages are sent one after another. Events have no id, so the Remote must get them in the
 /// order they were created. A send only puts the frame in the session queue, so this is fast.
+/// Responses to requests are sent here too.
 struct WsSender {
-    id: String,
+    id: Arc<str>,
     session: Session,
     msg_tracing_out: bool,
 }
@@ -42,14 +49,20 @@ impl Handler<SendWsMessage> for WsSender {
     type Result = ();
 
     fn handle(&mut self, msg: SendWsMessage, ctx: &mut Self::Context) {
-        let id = self.id.clone();
+        let id = Arc::clone(&self.id);
         let msg_tracing_out = self.msg_tracing_out;
         let mut session = self.session.clone();
 
         // `wait` blocks the mailbox until the message is sent: keeps the order.
         ctx.wait(
             async move {
-                let _ = WsConn::send(&id, msg_tracing_out, &msg.0, &mut session).await;
+                let send = WsConn::send(&id, msg_tracing_out, &msg.0, &mut session);
+                if timeout(SEND_TIMEOUT, send).await.is_err() {
+                    // A lost message leaves an old state on the Remote. After a new connection,
+                    // the Remote gets the full state again.
+                    warn!("[{id}] Remote does not read, closing the connection");
+                    close(session, None).await;
+                }
             }
             .into_actor(self)
             .map(|(), _, _| ()),
@@ -77,7 +90,7 @@ impl WsConn {
             .await;
 
         let sender = WsSender {
-            id: self.id.clone(),
+            id: Arc::clone(&self.id),
             session: session.clone(),
             msg_tracing_out: self.msg_tracing_out,
         }
@@ -86,7 +99,7 @@ impl WsConn {
         if let Err(e) = self
             .controller_addr
             .send(NewR2Session {
-                addr: sender.recipient(),
+                addr: sender.clone().recipient(),
                 id: self.id.clone(),
             })
             .await
@@ -109,32 +122,37 @@ impl WsConn {
                 _ = hb_interval.tick() => {
                     if Instant::now().duration_since(self.hb) > self.heartbeat.timeout {
                         info!("[{}] Closing connection due to failed heartbeat", self.id);
-                        let _ = session.close(Some(CloseReason {
+                        close(session, Some(CloseReason {
                             code: CloseCode::Away,
                             description: Some("heartbeat timeout".into()),
                         })).await;
                         break;
                     }
-                    let _ = session.ping(b"").await;
+                    // Also ends the loop if the session was closed.
+                    if !matches!(timeout(SEND_TIMEOUT, session.ping(b"")).await, Ok(Ok(()))) {
+                        info!("[{}] Closing connection: Remote does not read", self.id);
+                        close(session, None).await;
+                        break;
+                    }
                 }
                 msg = stream.next() => {
                     match msg {
                         Some(Ok(msg)) => {
-                            if let Err(close_reason) = self.handle_stream_message(msg, &mut session).await {
+                            if let Err(close_reason) = self.handle_stream_message(msg, &mut session, &sender).await {
                                 if close_reason.is_some() {
-                                    let _ = session.close(close_reason).await;
+                                    close(session, close_reason).await;
                                 }
                                 break;
                             }
                         }
                         Some(Err(e)) => {
                             info!("[{}] Closing WebSocket: {e:?}", self.id);
-                            let _ = session.close(None).await;
+                            close(session, None).await;
                             break;
                         }
                         None => {
                             debug!("[{}] Message stream ended, closing connection", self.id);
-                            let _ = session.close(None).await;
+                            close(session, None).await;
                             break;
                         }
                     }
@@ -155,6 +173,7 @@ impl WsConn {
         &mut self,
         msg: AggregatedMessage,
         session: &mut Session,
+        sender: &Addr<WsSender>,
     ) -> Result<(), Option<CloseReason>> {
         self.hb = Instant::now();
         match msg {
@@ -162,11 +181,14 @@ impl WsConn {
                 if self.msg_tracing_in {
                     debug!("[{}] -> {text}", self.id);
                 }
-                self.handle_text_message(&text, session).await
+                self.handle_text_message(&text, sender)
             }
             AggregatedMessage::Binary(data) => self.handle_binary_message(data).await,
             AggregatedMessage::Ping(bytes) => {
-                let _ = session.pong(&bytes).await;
+                if timeout(SEND_TIMEOUT, session.pong(&bytes)).await.is_err() {
+                    info!("[{}] Closing connection: Remote does not read", self.id);
+                    return Err(None);
+                }
                 Ok(())
             }
             AggregatedMessage::Pong(_) => Ok(()),
@@ -177,13 +199,16 @@ impl WsConn {
         }
     }
 
-    async fn handle_text_message(
+    fn handle_text_message(
         &self,
         text: &str,
-        session: &mut Session,
+        sender: &Addr<WsSender>,
     ) -> Result<(), Option<CloseReason>> {
         match serde_json::from_str::<WsMessage>(text) {
-            Ok(msg) => self.process_intg_api_message(msg, session).await,
+            Ok(msg) => {
+                self.process_intg_api_message(msg, sender);
+                Ok(())
+            }
             Err(e) => {
                 warn!("[{}] Invalid JSON message: {e}", self.id);
                 Err(Some(CloseReason {
@@ -195,58 +220,53 @@ impl WsConn {
     }
 
     /// Process a received Integration-API request, response or event message.
-    async fn process_intg_api_message(
-        &self,
-        msg: WsMessage,
-        session: &mut Session,
-    ) -> Result<(), Option<CloseReason>> {
+    ///
+    /// A request runs in its own task, so a slow request does not stop reading the next
+    /// messages. The responses are sent with `sender` and can come in a different order.
+    fn process_intg_api_message(&self, mut msg: WsMessage, sender: &Addr<WsSender>) {
         let req_id = msg.id.unwrap_or_default();
 
         match msg.kind.as_deref() {
             Some("req") => {
-                let req_msg = msg.msg.clone().unwrap_or_default();
-                match Self::on_request(&self.id, msg, self.controller_addr.clone()).await {
-                    Ok(Some(response)) => {
-                        Self::send(&self.id, self.msg_tracing_out, &response, session).await
+                let id = Arc::clone(&self.id);
+                let sender = sender.clone();
+                let request = Self::on_request(&id, &mut msg, &self.controller_addr);
+                actix_web::rt::spawn(async move {
+                    let result = match request {
+                        Ok(request) => request.await.unwrap_or_else(|e| Err(e.into())),
+                        Err(e) => Err(e),
+                    };
+                    match result {
+                        Ok(Some(response)) => sender.do_send(SendWsMessage(response)),
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!(
+                                "[{id}] Error processing received message '{}': {e}",
+                                msg.msg.as_deref().unwrap_or_default()
+                            );
+                            send_error_response(&id, req_id, e, &sender);
+                        }
                     }
-                    Ok(None) => Ok(()),
-                    Err(e) => {
-                        warn!(
-                            "[{}] Error processing received message '{req_msg}': {e}",
-                            self.id
-                        );
-                        self.send_error_response(req_id, e, session).await
-                    }
-                }
+                });
             }
             Some("resp") => {
                 if let Err(e) = Self::on_response(&self.id, msg, &self.controller_addr) {
                     warn!("[{}] Error processing response: {e}", self.id);
                 }
-                Ok(())
             }
             Some("event") => {
                 if let Err(e) = Self::on_event(&self.id, msg, &self.controller_addr) {
                     warn!("[{}] Error processing event: {e}", self.id);
                 }
-                Ok(())
             }
             Some(other) => {
                 warn!("[{}] Unsupported message kind: {other}", self.id);
-                self.send_error_response(
-                    req_id,
-                    ServiceError::BadRequest(format!("Unsupported message kind: {other}")),
-                    session,
-                )
-                .await
+                let e = ServiceError::BadRequest(format!("Unsupported message kind: {other}"));
+                send_error_response(&self.id, req_id, e, sender);
             }
             None => {
-                self.send_error_response(
-                    req_id,
-                    ServiceError::BadRequest("Missing property: kind".into()),
-                    session,
-                )
-                .await
+                let e = ServiceError::BadRequest("Missing property: kind".into());
+                send_error_response(&self.id, req_id, e, sender);
             }
         }
     }
@@ -327,16 +347,6 @@ impl WsConn {
         }
     }
 
-    async fn send_error_response(
-        &self,
-        req_id: u32,
-        error: ServiceError,
-        session: &mut Session,
-    ) -> Result<(), Option<CloseReason>> {
-        let response = service_error_to_ws_message(&self.id, req_id, error);
-        Self::send(&self.id, self.msg_tracing_out, &response, session).await
-    }
-
     /// Send a message to the WebSocket session. Returns `Err` if the session is closed.
     async fn send(
         id: &str,
@@ -360,6 +370,17 @@ impl WsConn {
             }
         }
     }
+}
+
+/// Close the session. Does not wait long if the Remote does not read.
+async fn close(session: Session, reason: Option<CloseReason>) {
+    let _ = timeout(SEND_TIMEOUT, session.close(reason)).await;
+}
+
+fn send_error_response(id: &str, req_id: u32, error: ServiceError, sender: &Addr<WsSender>) {
+    sender.do_send(SendWsMessage(service_error_to_ws_message(
+        id, req_id, error,
+    )));
 }
 
 fn service_error_to_ws_message(id: &str, req_id: u32, error: ServiceError) -> WsMessage {

@@ -5,6 +5,9 @@
 //!
 //! Files are written to a temporary file first and then renamed, so a crash never leaves a broken
 //! file. The configuration holds credentials and is only readable by the owner.
+//!
+//! The data is serialized on the caller thread. One background thread writes the files in order,
+//! so the actor thread does not wait for the disk.
 
 use log::{error, info};
 use ratv::{Credentials, ExposeSecret};
@@ -14,6 +17,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const CONFIG_FILE: &str = "config.json";
 /// Length of the device key used in entity ids.
@@ -98,19 +104,46 @@ pub fn fnv1a(data: &[u8]) -> u64 {
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     dir: PathBuf,
+    writer: Arc<Writer>,
 }
 
 impl ConfigStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            writer: Arc::new(Writer::new()),
+        }
     }
 
     /// Load the configured devices. A missing file gives an empty list.
+    ///
+    /// A broken file is moved to `config.json.bad-<unix time>`, so the next save does not
+    /// overwrite it.
     pub fn load_devices(&self) -> Vec<DeviceConfig> {
+        self.writer.flush();
         let path = self.dir.join(CONFIG_FILE);
         match read_json(&path) {
             Ok(Some(devices)) => devices,
             Ok(None) => Vec::new(),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                let secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let bad = self.dir.join(format!("{CONFIG_FILE}.bad-{secs}"));
+                match fs::rename(&path, &bad) {
+                    Ok(()) => error!(
+                        "Invalid {}: {e}. The file was moved to {}",
+                        path.display(),
+                        bad.display()
+                    ),
+                    Err(re) => error!(
+                        "Invalid {}: {e}. Could not move the file to {}: {re}",
+                        path.display(),
+                        bad.display()
+                    ),
+                }
+                Vec::new()
+            }
             Err(e) => {
                 error!("Error reading {}: {e}", path.display());
                 Vec::new()
@@ -118,15 +151,24 @@ impl ConfigStore {
         }
     }
 
-    /// Save the configured devices.
+    /// Save the configured devices. Waits for the write, so the caller gets write errors.
     pub fn save_devices(&self, devices: &[DeviceConfig]) -> io::Result<()> {
-        write_json(&self.dir.join(CONFIG_FILE), &devices, true)?;
+        let data = serde_json::to_vec_pretty(&devices).map_err(io::Error::other)?;
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.writer.send(Job::Write {
+            path: self.dir.join(CONFIG_FILE),
+            data,
+            private: true,
+            done: Some(tx),
+        });
+        rx.recv().map_err(io::Error::other)??;
         info!("Saved configuration with {} device(s)", devices.len());
         Ok(())
     }
 
     /// Load the cache of a device. A missing or broken file gives `None`.
     pub fn load_cache<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
+        self.writer.flush();
         let path = self.cache_path(key);
         read_json(&path).unwrap_or_else(|e| {
             error!("Error reading {}: {e}", path.display());
@@ -134,23 +176,142 @@ impl ConfigStore {
         })
     }
 
-    /// Save the cache of a device.
+    /// Save the cache of a device. Write errors are only logged.
     pub fn save_cache<T: Serialize>(&self, key: &str, cache: &T) -> io::Result<()> {
-        write_json(&self.cache_path(key), cache, false)
+        self.write_json(self.cache_path(key), cache, false)
     }
 
     /// Delete the cache of a device.
     pub fn remove_cache(&self, key: &str) {
-        let path = self.cache_path(key);
-        if let Err(e) = fs::remove_file(&path)
-            && e.kind() != io::ErrorKind::NotFound
-        {
-            error!("Error deleting {}: {e}", path.display());
-        }
+        self.writer.send(Job::Remove(self.cache_path(key)));
     }
 
     fn cache_path(&self, key: &str) -> PathBuf {
         self.dir.join(format!("cache_{key}.json"))
+    }
+
+    /// Serialize the value and queue the write. Returns only serialization errors.
+    fn write_json<T: Serialize + ?Sized>(
+        &self,
+        path: PathBuf,
+        value: &T,
+        private: bool,
+    ) -> io::Result<()> {
+        let data = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
+        self.writer.send(Job::Write {
+            path,
+            data,
+            private,
+            done: None,
+        });
+        Ok(())
+    }
+}
+
+/// File changes for the background thread.
+#[derive(Debug)]
+enum Job {
+    Write {
+        path: PathBuf,
+        data: Vec<u8>,
+        private: bool,
+        /// Gets the result. Without it, errors are only logged.
+        done: Option<mpsc::SyncSender<io::Result<()>>>,
+    },
+    Remove(PathBuf),
+    /// Answer when all earlier jobs are done.
+    Flush(mpsc::SyncSender<()>),
+}
+
+impl Job {
+    fn run(self) {
+        match self {
+            Self::Write {
+                path,
+                data,
+                private,
+                done,
+            } => {
+                let result = write_file(&path, &data, private);
+                if let Err(e) = &result {
+                    error!("Error writing {}: {e}", path.display());
+                }
+                if let Some(done) = done {
+                    let _ = done.send(result);
+                }
+            }
+            Self::Remove(path) => {
+                if let Err(e) = fs::remove_file(&path)
+                    && e.kind() != io::ErrorKind::NotFound
+                {
+                    error!("Error deleting {}: {e}", path.display());
+                }
+            }
+            Self::Flush(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
+/// Runs the jobs in order on one thread. When the last [`ConfigStore`] is dropped, the queued
+/// jobs are done before the thread ends.
+#[derive(Debug)]
+struct Writer {
+    tx: Option<mpsc::Sender<Job>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Writer {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel::<Job>();
+        match thread::Builder::new()
+            .name("config-writer".into())
+            .spawn(move || rx.into_iter().for_each(Job::run))
+        {
+            Ok(thread) => Self {
+                tx: Some(tx),
+                thread: Some(thread),
+            },
+            Err(e) => {
+                error!("Could not start the config writer thread, writing directly: {e}");
+                Self {
+                    tx: None,
+                    thread: None,
+                }
+            }
+        }
+    }
+
+    /// Queue the job. Without the thread, the job runs on the caller thread.
+    fn send(&self, job: Job) {
+        let job = match &self.tx {
+            Some(tx) => match tx.send(job) {
+                Ok(()) => return,
+                Err(mpsc::SendError(job)) => job,
+            },
+            None => job,
+        };
+        job.run();
+    }
+
+    /// Wait until all queued jobs are done.
+    fn flush(&self) {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.send(Job::Flush(tx));
+        let _ = rx.recv();
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // Closing the channel ends the thread after the queued jobs.
+        self.tx = None;
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            error!("The config writer thread failed");
+        }
     }
 }
 
@@ -158,30 +319,48 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     match fs::read(path) {
         Ok(data) => serde_json::from_slice(&data)
             .map(Some)
-            .map_err(io::Error::other),
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T, private: bool) -> io::Result<()> {
-    let data = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
+fn write_file(
+    path: &Path,
+    data: &[u8],
+    // Only Unix has file modes.
+    #[cfg_attr(not(unix), expect(unused_variables))] private: bool,
+) -> io::Result<()> {
     let tmp = path.with_extension("json.tmp");
+    // A file left from a failed write keeps its old mode, so always create a new file.
+    if let Err(e) = fs::remove_file(&tmp)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        return Err(e);
+    }
     {
         let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         if private {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        #[cfg(not(unix))]
-        let _ = private;
         let mut file = options.open(&tmp)?;
-        file.write_all(&data)?;
+        file.write_all(data)?;
         file.sync_all()?;
     }
-    fs::rename(&tmp, path)
+    fs::rename(&tmp, path)?;
+    // Make the rename durable.
+    #[cfg(unix)]
+    {
+        let dir = path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -236,6 +415,8 @@ mod tests {
         let store = ConfigStore::new(&dir);
         assert_eq!(Vec::<DeviceConfig>::new(), store.load_devices());
 
+        // A file left from a failed write must not keep its mode.
+        fs::write(dir.join("config.json.tmp"), b"x").expect("tmp");
         let devices = vec![device()];
         store.save_devices(&devices).expect("save");
         assert_eq!(devices, store.load_devices());
@@ -259,6 +440,34 @@ mod tests {
         );
         store.remove_cache("KEY");
         assert_eq!(None, store.load_cache::<Vec<String>>("KEY"));
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn broken_config_is_moved() {
+        let dir =
+            std::env::temp_dir().join(format!("uc-intg-appletv-test-bad-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join(CONFIG_FILE), b"{broken").expect("write");
+        let store = ConfigStore::new(&dir);
+        assert_eq!(Vec::<DeviceConfig>::new(), store.load_devices());
+        assert!(!dir.join(CONFIG_FILE).exists());
+
+        let bad: Vec<_> = fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.json.bad-")
+            })
+            .collect();
+        assert_eq!(1, bad.len());
+        assert_eq!(
+            b"{broken".as_slice(),
+            fs::read(bad[0].path()).expect("read")
+        );
 
         fs::remove_dir_all(&dir).expect("cleanup");
     }

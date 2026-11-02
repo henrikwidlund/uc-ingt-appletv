@@ -9,13 +9,14 @@ use crate::server::ws::WsConn;
 use actix::Addr;
 use log::{error, info, warn};
 use std::str::FromStr;
+use std::sync::Arc;
 use uc_api::intg::ws::R2Event;
 use uc_api::ws::WsMessage;
 
 impl WsConn {
     /// Forward an event message to the controller.
     pub(crate) fn on_event(
-        session_id: &str,
+        session_id: &Arc<str>,
         event: WsMessage,
         controller_addr: &Addr<Controller>,
     ) -> Result<(), ServiceError> {
@@ -28,7 +29,7 @@ impl WsConn {
 
         if let Ok(event_msg) = R2Event::from_str(msg) {
             if let Err(e) = controller_addr.try_send(R2EventMsg {
-                ws_id: session_id.into(),
+                ws_id: session_id.clone(),
                 event: event_msg,
             }) {
                 // Do not return an error: it would be sent back to the client.

@@ -391,10 +391,21 @@ pub fn command(cmd_id: &str, params: Option<&Map<String, Value>>) -> Result<Acti
         Cmd::Next => Action::Next,
         Cmd::FastForward => Action::FastForwardBegin,
         Cmd::Rewind => Action::RewindBegin,
-        Cmd::Seek => Action::Seek(param_f64(params, "media_position")?),
+        Cmd::Seek => {
+            let position = param_f64(params, "media_position")?;
+            if position < 0.0 {
+                return Err(ServiceError::BadRequest(
+                    "Invalid parameter: media_position".into(),
+                ));
+            }
+            Action::Seek(position)
+        }
         Cmd::Volume => {
             let v = param_f64(params, "volume")?;
-            Action::Volume(v.clamp(0.0, 100.0).round() as u8)
+            if !(0.0..=100.0).contains(&v) {
+                return Err(ServiceError::BadRequest("Invalid parameter: volume".into()));
+            }
+            Action::Volume(v.round() as u8)
         }
         Cmd::VolumeUp => Action::VolumeUp,
         Cmd::VolumeDown => Action::VolumeDown,
@@ -478,6 +489,7 @@ pub fn param_str<'a>(
         .ok_or_else(|| ServiceError::BadRequest(format!("Missing parameter: {name}")))
 }
 
+/// Number parameter. `NaN` and infinite values are rejected.
 fn param_f64(params: Option<&Map<String, Value>>, name: &str) -> Result<f64, ServiceError> {
     let value = params
         .and_then(|p| p.get(name))
@@ -485,6 +497,7 @@ fn param_f64(params: Option<&Map<String, Value>>, name: &str) -> Result<f64, Ser
     value
         .as_f64()
         .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+        .filter(|v: &f64| v.is_finite())
         .ok_or_else(|| ServiceError::BadRequest(format!("Invalid parameter: {name}")))
 }
 
@@ -561,7 +574,7 @@ mod tests {
     fn map_commands_with_params() {
         let p = params(json!({ "volume": 42.4 }));
         assert_eq!(Action::Volume(42), command("volume", Some(&p)).expect("ok"));
-        let p = params(json!({ "volume": 150 }));
+        let p = params(json!({ "volume": "100" }));
         assert_eq!(
             Action::Volume(100),
             command("volume", Some(&p)).expect("ok")
@@ -599,6 +612,29 @@ mod tests {
             command("eject", None),
             Err(ServiceError::NotSupported(_))
         ));
+    }
+
+    #[test]
+    fn invalid_numbers() {
+        for (cmd, p) in [
+            ("volume", json!({ "volume": 150 })),
+            ("volume", json!({ "volume": -1 })),
+            ("volume", json!({ "volume": "NaN" })),
+            ("volume", json!({ "volume": "inf" })),
+            ("seek", json!({ "media_position": -5 })),
+            ("seek", json!({ "media_position": "NaN" })),
+            ("seek", json!({ "media_position": "-inf" })),
+        ] {
+            assert!(
+                matches!(
+                    command(cmd, Some(&params(p.clone()))),
+                    Err(ServiceError::BadRequest(_))
+                ),
+                "{cmd} {p}"
+            );
+        }
+        let p = params(json!({ "media_position": 0 }));
+        assert_eq!(Action::Seek(0.0), command("seek", Some(&p)).expect("ok"));
     }
 
     #[test]

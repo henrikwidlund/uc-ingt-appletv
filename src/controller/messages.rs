@@ -8,6 +8,7 @@ use crate::errors::ServiceError;
 use crate::util::DeserializeMsgData;
 use actix::prelude::{Message, Recipient};
 use bytes::Bytes;
+use std::sync::Arc;
 use uc_api::intg::ws::{R2Event, R2Request, R2Response};
 use uc_api::ws::WsMessage;
 
@@ -26,7 +27,7 @@ pub struct NewR2Session {
     /// Address of the WebSocket session to send messages to.
     pub addr: Recipient<SendWsMessage>,
     /// Unique identifier of the WebSocket connection.
-    pub id: String,
+    pub id: Arc<str>,
 }
 
 /// A Remote disconnected.
@@ -34,7 +35,7 @@ pub struct NewR2Session {
 #[rtype(result = "()")]
 pub struct R2SessionDisconnect {
     /// Unique identifier of the WebSocket connection.
-    pub id: String,
+    pub id: Arc<str>,
 }
 
 /// Request message from a Remote.
@@ -43,7 +44,7 @@ pub struct R2SessionDisconnect {
 #[derive(Debug, Message)]
 #[rtype(result = "Result<Option<WsMessage>, ServiceError>")]
 pub struct R2RequestMsg {
-    pub ws_id: String,
+    pub ws_id: Arc<str>,
     pub req_id: u32,
     pub request: R2Request,
     pub msg_data: Option<serde_json::Value>,
@@ -61,7 +62,7 @@ impl DeserializeMsgData for R2RequestMsg {}
 #[derive(Debug, Message)]
 #[rtype(result = "()")]
 pub struct R2ResponseMsg {
-    pub ws_id: String,
+    pub ws_id: Arc<str>,
     pub msg: R2Response,
 }
 
@@ -69,7 +70,7 @@ pub struct R2ResponseMsg {
 #[derive(Debug, Message)]
 #[rtype(result = "()")]
 pub struct R2EventMsg {
-    pub ws_id: String,
+    pub ws_id: Arc<str>,
     pub event: R2Event,
 }
 

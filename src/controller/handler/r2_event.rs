@@ -25,7 +25,16 @@ impl Handler<R2EventMsg> for Controller {
                 // The Remote might be out of sync.
                 self.send_device_state(&msg.ws_id);
             }
-            R2Event::Disconnect => self.disconnect_devices(),
+            R2Event::Disconnect => {
+                // Keep the connections while another Remote is still awake.
+                if self
+                    .sessions
+                    .iter()
+                    .all(|(id, s)| *id == msg.ws_id || s.standby)
+                {
+                    self.disconnect_devices();
+                }
+            }
             R2Event::EnterStandby => {
                 session.standby = true;
                 // Keep the connections while another Remote is still awake.
@@ -40,7 +49,7 @@ impl Handler<R2EventMsg> for Controller {
             }
             R2Event::AbortDriverSetup => {
                 ctx.notify(AbortDriverSetup {
-                    ws_id: msg.ws_id,
+                    ws_id: msg.ws_id.to_string(),
                     timeout: false,
                 });
             }

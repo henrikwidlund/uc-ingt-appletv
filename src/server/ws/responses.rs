@@ -9,13 +9,14 @@ use crate::server::ws::WsConn;
 use actix::Addr;
 use log::{debug, error, warn};
 use std::str::FromStr;
+use std::sync::Arc;
 use uc_api::intg::ws::R2Response;
 use uc_api::ws::WsMessage;
 
 impl WsConn {
     /// Forward a response message to the controller.
     pub(crate) fn on_response(
-        session_id: &str,
+        session_id: &Arc<str>,
         response: WsMessage,
         controller_addr: &Addr<Controller>,
     ) -> Result<(), ServiceError> {
@@ -28,7 +29,7 @@ impl WsConn {
 
         if let Ok(resp_msg) = R2Response::from_str(msg) {
             if let Err(e) = controller_addr.try_send(R2ResponseMsg {
-                ws_id: session_id.into(),
+                ws_id: session_id.clone(),
                 msg: resp_msg,
             }) {
                 error!("[{session_id}] Controller mailbox error: {e}");

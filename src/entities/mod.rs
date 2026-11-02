@@ -94,12 +94,20 @@ impl EntityKind {
 
     /// Build the entity id for a device key.
     pub fn entity_id(self, key: &str) -> String {
+        let mut id = String::new();
+        self.write_entity_id(key, &mut id);
+        id
+    }
+
+    /// Append the entity id for a device key to `out`.
+    pub fn write_entity_id(self, key: &str, out: &mut String) {
+        use std::fmt::Write;
         let ty = self.entity_type();
-        match self {
-            Self::MediaPlayer | Self::Remote | Self::VoiceAssistant => format!("{ty}.{key}"),
-            Self::Select(s) => format!("{ty}.{key}.{}", s.as_ref()),
-            Self::Sensor(s) => format!("{ty}.{key}.{}", s.as_ref()),
-        }
+        let _ = match self {
+            Self::MediaPlayer | Self::Remote | Self::VoiceAssistant => write!(out, "{ty}.{key}"),
+            Self::Select(s) => write!(out, "{ty}.{key}.{}", s.as_ref()),
+            Self::Sensor(s) => write!(out, "{ty}.{key}.{}", s.as_ref()),
+        };
     }
 
     /// Parse an entity id into the device key and the entity kind.

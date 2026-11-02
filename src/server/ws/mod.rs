@@ -10,6 +10,7 @@ use actix::Addr;
 use actix_web::{Error, HttpRequest, HttpResponse, get, web};
 use log::debug;
 use std::env;
+use std::sync::Arc;
 use std::time::Instant;
 
 mod connection;
@@ -20,7 +21,7 @@ mod responses;
 /// WebSocket connection of one Remote.
 struct WsConn {
     /// Unique connection identifier, used for logging and to route messages in the [`Controller`].
-    id: String,
+    id: Arc<str>,
     /// Time of the last client activity.
     hb: Instant,
     /// [`Controller`] address for sending events and requests.
@@ -40,7 +41,7 @@ impl WsConn {
     ) -> Self {
         let msg_tracing = env::var(ENV_API_MSG_TRACING).unwrap_or_default();
         Self {
-            id: client_id,
+            id: client_id.into(),
             hb: Instant::now(),
             controller_addr,
             heartbeat,

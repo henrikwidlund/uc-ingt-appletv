@@ -71,7 +71,11 @@ pub enum Call {
 /// State that changes how actions are run.
 pub struct Planner<'a> {
     pub s: &'a Snapshot,
+    /// Changed by the plan. Use it only if the plan succeeds.
     pub seek: &'a mut Option<Seek>,
+    /// Power and mute for toggles: the last set values until the device reports them.
+    pub power: Power,
+    pub muted: Option<bool>,
     pub screensaver: bool,
     /// A power-on call was added already.
     pub powered: bool,
@@ -81,7 +85,7 @@ impl Planner<'_> {
     /// Add the calls of an action.
     #[allow(clippy::too_many_lines)]
     pub fn plan(&mut self, action: &Action, out: &mut Vec<Call>) -> Result<(), ServiceError> {
-        if action.needs_power() && self.s.power == Power::Off && !self.powered {
+        if action.needs_power() && self.power == Power::Off && !self.powered {
             out.push(Call::TurnOn);
             self.powered = true;
         }
@@ -91,7 +95,7 @@ impl Planner<'_> {
             Action::On => Call::TurnOn,
             Action::Off => Call::TurnOff,
             Action::Toggle => {
-                if s.power == Power::On {
+                if self.power == Power::On {
                     Call::TurnOff
                 } else {
                     Call::TurnOn
@@ -143,7 +147,7 @@ impl Planner<'_> {
             }
             Action::VolumeUp => Call::Press(Key::VolumeUp),
             Action::VolumeDown => Call::Press(Key::VolumeDown),
-            Action::MuteToggle => Call::Mute(s.muted != Some(true)),
+            Action::MuteToggle => Call::Mute(self.muted != Some(true)),
             Action::Mute(m) => Call::Mute(*m),
             Action::Repeat(m) => Call::Repeat(*m),
             Action::Shuffle(m) => Call::Shuffle(*m),
@@ -328,6 +332,14 @@ fn next_language<'a>(
     options.get(next)
 }
 
+/// Run the calls in order. Stops at the first error.
+pub async fn exec_all(tv: &AppleTv, calls: Vec<Call>) -> Result<(), ratv::Error> {
+    for call in calls {
+        exec(tv, call).await?;
+    }
+    Ok(())
+}
+
 /// Run one call.
 pub async fn exec(tv: &AppleTv, call: Call) -> Result<(), ratv::Error> {
     match call {
@@ -402,6 +414,8 @@ mod tests {
         let mut p = Planner {
             s,
             seek,
+            power: s.power,
+            muted: s.muted,
             screensaver: false,
             powered: false,
         };
@@ -464,6 +478,8 @@ mod tests {
         let mut p = Planner {
             s: &s,
             seek: &mut seek,
+            power: s.power,
+            muted: None,
             screensaver: true,
             powered: false,
         };
@@ -505,6 +521,8 @@ mod tests {
         let mut p = Planner {
             s: &s,
             seek: &mut None,
+            power: Power::Unknown,
+            muted: None,
             screensaver: false,
             powered: false,
         };
@@ -521,6 +539,8 @@ mod tests {
         let mut p = Planner {
             s: &s,
             seek: &mut None,
+            power: Power::Unknown,
+            muted: None,
             screensaver: false,
             powered: false,
         };

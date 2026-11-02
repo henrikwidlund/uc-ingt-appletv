@@ -28,8 +28,12 @@ impl Handler<NewR2Session> for Controller {
 impl Handler<R2SessionDisconnect> for Controller {
     type Result = ();
 
-    fn handle(&mut self, msg: R2SessionDisconnect, _: &mut Context<Self>) {
+    fn handle(&mut self, msg: R2SessionDisconnect, ctx: &mut Context<Self>) {
         info!("[{}] Remote disconnected", msg.id);
+        // End the setup flow of this Remote, so that other Remotes can start one.
+        if self.setup_owner.as_deref() == Some(&*msg.id) {
+            self.abort_setup(&msg.id, false, ctx);
+        }
         self.sessions.remove(&msg.id);
     }
 }

@@ -27,7 +27,7 @@ pub const fn dirty_groups(kind: SelectKind) -> Dirty {
         SelectKind::AudioOutput => Dirty::OUTPUTS,
         SelectKind::AudioLanguage | SelectKind::Subtitles => Dirty::LANGUAGES,
         SelectKind::Account => Dirty::ACCOUNTS,
-        SelectKind::Chapter => Dirty::CHAPTERS.or(Dirty::POSITION),
+        SelectKind::Chapter => Dirty::CHAPTERS.or(Dirty::CHAPTER),
         SelectKind::UpNext => Dirty::QUEUE,
         SelectKind::PlaybackSpeed => Dirty::RATE,
         SelectKind::Shuffle | SelectKind::Repeat => Dirty::SHUFFLE_REPEAT,
@@ -48,13 +48,24 @@ pub fn attributes(
             if s.connected { "ON" } else { "UNAVAILABLE" }.into(),
         );
     }
-    if dirty.any(dirty_groups(kind) | Dirty::CONNECTION) {
-        out.insert("options".into(), json!(options(s, kind)));
+    if !dirty.any(dirty_groups(kind) | Dirty::CONNECTION) {
+        return;
+    }
+    // Only the current chapter changed. The list is not built.
+    if kind == SelectKind::Chapter && !dirty.any(Dirty::CHAPTERS | Dirty::CONNECTION) {
         out.insert(
             "current_option".into(),
             current(s, kind, now).unwrap_or_default().into(),
         );
+        return;
     }
+    let options = options(s, kind);
+    let current = match kind {
+        SelectKind::Chapter => s.current_chapter(now).and_then(|i| options.get(i).cloned()),
+        _ => current(s, kind, now),
+    };
+    out.insert("current_option".into(), current.unwrap_or_default().into());
+    out.insert("options".into(), json!(options));
 }
 
 /// Option names of a select.
@@ -77,11 +88,7 @@ pub fn options(s: &Snapshot, kind: SelectKind) -> Vec<Cow<'_, str>> {
             .iter()
             .map(|a| Cow::Borrowed(a.name.as_str()))
             .collect(),
-        SelectKind::Chapter => unique(s.chapters.iter().enumerate().map(|(i, c)| {
-            c.title
-                .as_deref()
-                .map_or_else(|| format!("Chapter {}", i + 1).into(), Cow::Borrowed)
-        })),
+        SelectKind::Chapter => unique(chapter_names(s)),
         SelectKind::UpNext => unique(s.up_next.iter().map(queue_item_name)),
         SelectKind::PlaybackSpeed => s
             .supported_rates
@@ -114,10 +121,7 @@ pub fn current(s: &Snapshot, kind: SelectKind, now: f64) -> Option<Cow<'_, str>>
             }
         }
         SelectKind::Account => s.current_account.as_deref().map(Cow::Borrowed),
-        SelectKind::Chapter => {
-            let i = s.current_chapter(now)?;
-            options(s, kind).into_iter().nth(i)
-        }
+        SelectKind::Chapter => nth_unique(chapter_names(s), s.current_chapter(now)?),
         // Up Next has no current item.
         SelectKind::UpNext => None,
         SelectKind::PlaybackSpeed => s
@@ -196,12 +200,26 @@ pub fn resolve(
 
 /// Display names of language options. Names are made unique.
 pub fn language_names(options: &[LanguageOption]) -> Vec<Cow<'_, str>> {
-    unique(options.iter().enumerate().map(|(i, o)| {
+    unique(raw_language_names(options))
+}
+
+/// Language names before they are made unique.
+fn raw_language_names(options: &[LanguageOption]) -> impl Iterator<Item = Cow<'_, str>> {
+    options.iter().enumerate().map(|(i, o)| {
         o.display_name
             .as_deref()
             .or(o.language_tag.as_deref())
             .map_or_else(|| Cow::Owned(format!("Track {}", i + 1)), Cow::Borrowed)
-    }))
+    })
+}
+
+/// Chapter names before they are made unique.
+fn chapter_names(s: &Snapshot) -> impl Iterator<Item = Cow<'_, str>> {
+    s.chapters.iter().enumerate().map(|(i, c)| {
+        c.title
+            .as_deref()
+            .map_or_else(|| format!("Chapter {}", i + 1).into(), Cow::Borrowed)
+    })
 }
 
 /// "Off", then the subtitles. The Auto option is named "Auto" instead of its tag.
@@ -228,7 +246,7 @@ fn current_language<'a>(
         .iter()
         .position(|o| o.identifier.is_some() && o.identifier == current.identifier)
         .or_else(|| options.iter().position(|o| o == current))?;
-    language_names(options).into_iter().nth(i)
+    nth_unique(raw_language_names(options), i)
 }
 
 fn queue_item_name(item: &QueueItem) -> Cow<'_, str> {
@@ -266,6 +284,16 @@ fn unique<'a>(names: impl Iterator<Item = Cow<'a, str>>) -> Vec<Cow<'a, str>> {
         }
     }
     out
+}
+
+/// Name at index `i` of [`unique`]. Only the names up to `i` are built.
+fn nth_unique<'a>(names: impl Iterator<Item = Cow<'a, str>>, i: usize) -> Option<Cow<'a, str>> {
+    let mut names = unique(names.take(i.saturating_add(1)));
+    if names.len() == i.saturating_add(1) {
+        names.pop()
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -321,6 +349,47 @@ mod tests {
             opts(&["English", "English (2)", "German", "English (3)"]),
             names
         );
+    }
+
+    #[test]
+    fn nth_unique_name() {
+        let names = ["English", "English", "German", "English"];
+        let all = unique(names.into_iter().map(Cow::Borrowed));
+        for (i, name) in all.iter().enumerate() {
+            assert_eq!(
+                Some(name),
+                nth_unique(names.into_iter().map(Cow::Borrowed), i).as_ref()
+            );
+        }
+        assert_eq!(None, nth_unique(names.into_iter().map(Cow::Borrowed), 4));
+    }
+
+    #[test]
+    fn chapter_position_update_sends_current_only() {
+        let chapter = |start: f64| {
+            let mut c = ratv::mrp::Chapter::default();
+            c.start = Some(start);
+            c
+        };
+        let s = Snapshot {
+            connected: true,
+            elapsed: Some(75.0),
+            chapters: vec![chapter(0.0), chapter(60.0)],
+            ..Snapshot::default()
+        };
+        let mut out = Map::new();
+        attributes(&s, SelectKind::Chapter, Dirty::POSITION, 0.0, &mut out);
+        assert!(out.is_empty());
+
+        let mut out = Map::new();
+        attributes(&s, SelectKind::Chapter, Dirty::CHAPTER, 0.0, &mut out);
+        assert_eq!(None, out.get("options"));
+        assert_eq!(Some(&json!("Chapter 2")), out.get("current_option"));
+
+        let mut out = Map::new();
+        attributes(&s, SelectKind::Chapter, Dirty::CHAPTERS, 0.0, &mut out);
+        assert_eq!(Some(&json!(["Chapter 1", "Chapter 2"])), out.get("options"));
+        assert_eq!(Some(&json!("Chapter 2")), out.get("current_option"));
     }
 
     #[test]
