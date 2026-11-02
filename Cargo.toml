@@ -15,7 +15,7 @@ default = ["mdns-sd"]
 mdns-sd = ["dep:mdns-sd"]
 
 [dependencies]
-uc_api = { git = "https://github.com/unfoldedcircle/api-model-rs", rev = "8853034", features = ["prost"] }
+uc_api = { git = "https://github.com/unfoldedcircle/api-model-rs", rev = "336beb1", features = ["prost"] }
 ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "292240d785348b2b643d4a756c287b35e6225d2e", features = ["opus"] }
 
 # WebSocket server
@@ -37,7 +37,7 @@ serde_json = "1"
 
 rust-fsm = "0.8"
 const_format = "0.2"
-strum = { version = "0.27", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 uuid = { version = "1", features = ["v4"] }
@@ -48,7 +48,7 @@ log = "0.4"
 mdns-sd = { version = "0.21.6", optional = true }
 
 [build-dependencies]
-built = { version = "0.8", features = ["chrono", "semver", "cargo-lock"] }
+built = { version = "0.8", features = ["cargo-lock"] }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -133,63 +133,25 @@ pub fn state(s: &Snapshot) -> &'static str {
 
 /// Insert the attributes of the dirty groups.
 pub fn attributes(s: &Snapshot, dirty: Dirty, now: f64, out: &mut Map<String, Value>) {
-    let mut set = |a: Attr, v: Value| {
-        out.insert(a.as_ref().into(), v);
-    };
     if dirty.any(Dirty::CONNECTION | Dirty::POWER | Dirty::PLAYBACK) {
-        set(Attr::State, state(s).into());
+        set(out, Attr::State, state(s).into());
     }
     // Media attributes are empty while off.
     let off = s.power == Power::Off || !s.connected;
 
     if dirty.any(Dirty::VOLUME | Dirty::CONNECTION) {
         if let Some(v) = s.volume_percent() {
-            set(Attr::Volume, v.into());
+            set(out, Attr::Volume, v.into());
         }
         if let Some(m) = s.muted {
-            set(Attr::Muted, m.into());
+            set(out, Attr::Muted, m.into());
         }
     }
     if dirty.any(Dirty::METADATA | Dirty::POWER | Dirty::CONNECTION) {
-        let text = |v: &Option<String>| -> Value {
-            if off { "" } else { v.as_deref().unwrap_or("") }.into()
-        };
-        let title = if off { "" } else { title(s).unwrap_or("") };
-        set(Attr::MediaTitle, title.into());
-        // TV shows have the series name as artist.
-        let artist = if s.artist.is_some() {
-            &s.artist
-        } else {
-            &s.series_name
-        };
-        set(Attr::MediaArtist, text(artist));
-        set(Attr::MediaAlbum, text(&s.album));
-        let media_type = if off { None } else { media_type(s) };
-        set(
-            Attr::MediaType,
-            media_type
-                .as_ref()
-                .map_or("", MediaContentType::as_str)
-                .into(),
-        );
+        metadata_attributes(s, off, out);
     }
     if dirty.any(Dirty::POSITION | Dirty::POWER | Dirty::CONNECTION) {
-        let pos = if off { None } else { s.position(now) };
-        let duration = if off { None } else { s.duration };
-        set(
-            Attr::MediaPosition,
-            pos.map_or(0, |p| p.round() as u64).into(),
-        );
-        set(
-            Attr::MediaDuration,
-            duration.map_or(0, |d| d.round() as u64).into(),
-        );
-        set(
-            Attr::MediaPositionUpdatedAt,
-            chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-                .into(),
-        );
+        position_attributes(s, off, now, out);
     }
     if dirty.any(Dirty::ARTWORK | Dirty::POWER | Dirty::CONNECTION) {
         let url = if off || s.state.is_none() {
@@ -197,34 +159,87 @@ pub fn attributes(s: &Snapshot, dirty: Dirty, now: f64, out: &mut Map<String, Va
         } else {
             s.artwork_url.as_deref()
         };
-        set(Attr::MediaImageUrl, url.unwrap_or("").into());
+        set(out, Attr::MediaImageUrl, url.unwrap_or("").into());
     }
     if dirty.any(Dirty::APPS | Dirty::CONNECTION) {
         let list: Vec<&str> = s.apps.iter().map(|a| a.name.as_str()).collect();
-        set(Attr::SourceList, json!(list));
-        set(Attr::Source, current_app(s).unwrap_or("").into());
+        set(out, Attr::SourceList, json!(list));
+        set(out, Attr::Source, current_app(s).unwrap_or("").into());
     }
     if dirty.any(Dirty::OUTPUTS | Dirty::CONNECTION) {
         let list: Vec<&str> = s.output_combos.iter().map(|c| c.name.as_str()).collect();
-        set(Attr::SoundModeList, json!(list));
+        set(out, Attr::SoundModeList, json!(list));
         let current = s
             .current_output_combo()
             .map_or("", |i| s.output_combos[i].name.as_str());
-        set(Attr::SoundMode, current.into());
+        set(out, Attr::SoundMode, current.into());
     }
     if dirty.any(Dirty::SHUFFLE_REPEAT | Dirty::CONNECTION) {
-        let repeat = match s.repeat {
-            Some(RepeatMode::All) => MediaPlayerRepeatMode::All,
-            Some(RepeatMode::One) => MediaPlayerRepeatMode::One,
-            _ => MediaPlayerRepeatMode::Off,
-        };
-        set(Attr::Repeat, repeat.as_ref().into());
-        let shuffle = matches!(s.shuffle, Some(ShuffleMode::Songs | ShuffleMode::Albums));
-        set(Attr::Shuffle, shuffle.into());
+        shuffle_repeat_attributes(s, out);
     }
 }
 
-/// Name of the app in the foreground.
+fn set(out: &mut Map<String, Value>, a: Attr, v: Value) {
+    out.insert(a.as_ref().into(), v);
+}
+
+fn metadata_attributes(s: &Snapshot, off: bool, out: &mut Map<String, Value>) {
+    let text =
+        |v: &Option<String>| -> Value { if off { "" } else { v.as_deref().unwrap_or("") }.into() };
+    let title = if off { "" } else { title(s).unwrap_or("") };
+    set(out, Attr::MediaTitle, title.into());
+    // TV shows have the series name as artist.
+    let artist = if s.artist.is_some() {
+        &s.artist
+    } else {
+        &s.series_name
+    };
+    set(out, Attr::MediaArtist, text(artist));
+    set(out, Attr::MediaAlbum, text(&s.album));
+    let media_type = if off { None } else { media_type(s) };
+    set(
+        out,
+        Attr::MediaType,
+        media_type
+            .as_ref()
+            .map_or("", MediaContentType::as_str)
+            .into(),
+    );
+}
+
+fn position_attributes(s: &Snapshot, off: bool, now: f64, out: &mut Map<String, Value>) {
+    let pos = if off { None } else { s.position(now) };
+    let duration = if off { None } else { s.duration };
+    set(
+        out,
+        Attr::MediaPosition,
+        pos.map_or(0, |p| p.round() as u64).into(),
+    );
+    set(
+        out,
+        Attr::MediaDuration,
+        duration.map_or(0, |d| d.round() as u64).into(),
+    );
+    set(
+        out,
+        Attr::MediaPositionUpdatedAt,
+        chrono::Utc::now()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            .into(),
+    );
+}
+
+fn shuffle_repeat_attributes(s: &Snapshot, out: &mut Map<String, Value>) {
+    let repeat = match s.repeat {
+        Some(RepeatMode::All) => MediaPlayerRepeatMode::All,
+        Some(RepeatMode::One) => MediaPlayerRepeatMode::One,
+        _ => MediaPlayerRepeatMode::Off,
+    };
+    set(out, Attr::Repeat, repeat.as_ref().into());
+    let shuffle = matches!(s.shuffle, Some(ShuffleMode::Songs | ShuffleMode::Albums));
+    set(out, Attr::Shuffle, shuffle.into());
+}
+
 /// Media title. For a TV episode it is the episode title, and the show is the artist.
 fn title(s: &Snapshot) -> Option<&str> {
     s.subtitle
@@ -233,6 +248,7 @@ fn title(s: &Snapshot) -> Option<&str> {
         .or(s.title.as_deref())
 }
 
+/// Name of the app in the foreground.
 pub fn current_app(s: &Snapshot) -> Option<&str> {
     let name = |bundle_id: &str| {
         s.apps

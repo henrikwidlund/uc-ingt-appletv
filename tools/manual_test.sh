@@ -37,7 +37,7 @@ echo "Where does the driver run?"
 echo "  1 + Enter = this script builds and starts it"
 echo "  2 + Enter = RustRover or another IDE"
 read -r -p "Choice: " mode
-if [ "$mode" = "2" ]; then
+if [[ "$mode" = "2" ]]; then
     IDE=1
     echo
     echo "In the RustRover run configuration:"
@@ -56,26 +56,26 @@ else
 fi
 # recent_log shows only lines written after this point.
 LOG_START=0
-if [ -n "$LOG" ] && [ -f "$LOG" ]; then
+if [[ -n "$LOG" ]] && [[ -f "$LOG" ]]; then
     LOG_START=$(wc -c <"$LOG" | tr -d ' ')
 fi
 
 # True if step $1 is in the selection.
 selected() {
     local n="$1" s
-    [ -z "$SELECTION" ] && return 0
+    [[ -z "$SELECTION" ]] && return 0
     for s in $SELECTION; do
         case "$s" in
-            *+) [ "$n" -ge "${s%+}" ] && return 0 ;;
-            *-*) [ "$n" -ge "${s%-*}" ] && [ "$n" -le "${s#*-}" ] && return 0 ;;
-            *) [ "$n" -eq "$s" ] && return 0 ;;
+            *+) [[ "$n" -ge "${s%+}" ]] && return 0 ;;
+            *-*) [[ "$n" -ge "${s%-*}" ]] && [[ "$n" -le "${s#*-}" ]] && return 0 ;;
+            *) [[ "$n" -eq "$s" ]] && return 0 ;;
         esac
     done
     return 1
 }
 
 stop_driver() {
-    if [ -n "$DRIVER_PID" ] && kill -0 "$DRIVER_PID" 2>/dev/null; then
+    if [[ -n "$DRIVER_PID" ]] && kill -0 "$DRIVER_PID" 2>/dev/null; then
         kill "$DRIVER_PID"
         wait "$DRIVER_PID" 2>/dev/null
         echo "Driver stopped."
@@ -84,7 +84,7 @@ stop_driver() {
 }
 
 start_driver() {
-    if [ "$IDE" = 1 ]; then
+    if [[ "$IDE" = 1 ]]; then
         read -r -p "Restart the driver in RustRover now, then press Enter: " _
         return
     fi
@@ -104,7 +104,7 @@ start_driver() {
 
 fake_ids() {
     # Replace the stored device ids with ids that no device has, as after a tvOS update.
-    if [ "$IDE" = 1 ]; then
+    if [[ "$IDE" = 1 ]]; then
         read -r -p "Stop the driver in RustRover now, then press Enter: " _
     else
         stop_driver
@@ -127,7 +127,7 @@ PY
 
 recent_log() {
     # Log lines of the driver from this run, without the HTTP server lines.
-    if [ -z "$LOG" ] || [ ! -f "$LOG" ]; then
+    if [[ -z "$LOG" ]] || [[ ! -f "$LOG" ]]; then
         echo "No log file. Look in the RustRover console for lines with: ${1:-any text}"
         return
     fi
@@ -158,12 +158,12 @@ step() {
         echo "$todo" | sed 's/^/  /'
         echo "Watch for:"
         echo "$watch" | sed 's/^/  /'
-        if [ -n "$cmd" ]; then
+        if [[ -n "$cmd" ]]; then
             echo "Command:"
             echo "  $cmd"
         fi
         echo
-        if [ -n "$cmd" ]; then
+        if [[ -n "$cmd" ]]; then
             read -r -p "Enter = run the command, s + Enter = skip this step, q + Enter = quit: " key
         else
             read -r -p "Enter = start this step, s + Enter = skip this step, q + Enter = quit: " key
@@ -178,8 +178,11 @@ step() {
                 save "" "## $STEP. $title" "" "- Result: SKIPPED"
                 return
                 ;;
+            *)
+                # Enter or any other key: run the step.
+                ;;
         esac
-        if [ -n "$cmd" ]; then
+        if [[ -n "$cmd" ]]; then
             echo "----- command output -----"
             eval "$cmd"
             echo "--------------------------"
@@ -197,7 +200,7 @@ step() {
                 save "" "## $STEP. $title" "" "- Result: NOT OK"
                 ;;
         esac
-        if [ -n "${note:-}" ]; then
+        if [[ -n "${note:-}" ]]; then
             save "- Note: $note"
         fi
         note=""
@@ -213,7 +216,7 @@ echo
 # The answers are kept for the next run. Enter keeps the last answer.
 SETUP_FILE="$PWD/.manual-test-setup"
 atv="" remote="" audio=""
-if [ -f "$SETUP_FILE" ]; then
+if [[ -f "$SETUP_FILE" ]]; then
     { read -r atv; read -r remote; read -r audio; } <"$SETUP_FILE"
 fi
 read -r -p "Apple TV model and tvOS version, Enter = '${atv:-unknown}': " answer
@@ -234,13 +237,13 @@ save "# Manual test $(date '+%Y-%m-%d %H:%M')" "" \
 # ---------------------------------------------------------------- driver and setup
 
 # Step 1 starts the driver. When step 1 is not selected, start it here.
-if [ "$IDE" = 0 ] && ! selected 1; then
+if [[ "$IDE" = 0 ]] && ! selected 1; then
     echo
     echo "Building and starting the driver..."
     cargo build --release && start_driver
 fi
 
-if [ "$IDE" = 1 ]; then
+if [[ "$IDE" = 1 ]]; then
     step "Start the driver" \
 "The Mac and the Remote are on the same network as the Apple TV.
 On the Apple TV: Settings > AirPlay and HomeKit > Allow Access = Anyone on the Same Network." \
