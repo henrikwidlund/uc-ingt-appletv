@@ -590,10 +590,14 @@ impl Controller {
         replace: Option<String>,
         ctx: &mut Context<Self>,
     ) {
-        info!("[{ws_id}] pairing with {} ({})", found.name, found.model);
+        let endpoints = found.endpoints;
+        let target = endpoints.companion.or(endpoints.airplay);
+        info!(
+            "[{ws_id}] pairing with {} ({}) at {target:?}",
+            found.name, found.model
+        );
         let mut options = PairOptions::default();
         options.name.clone_from(&self.device_ctx.client_name);
-        let endpoints = found.endpoints;
         let flow = self.setup_flow;
         ctx.spawn(
             async move { ratv::pair(&endpoints, &options).await }
@@ -976,9 +980,10 @@ fn parse_bool(values: &HashMap<String, String>, key: &str, default: bool) -> boo
     values.get(key).map_or(default, |v| v == "true")
 }
 
-const fn setup_error(e: &ratv::Error) -> IntegrationSetupError {
+fn setup_error(e: &ratv::Error) -> IntegrationSetupError {
     match e {
         e if e.is_auth() => IntegrationSetupError::AuthorizationError,
+        ratv::Error::PairingStep { source, .. } => setup_error(source),
         ratv::Error::Hap(_) => IntegrationSetupError::AuthorizationError,
         ratv::Error::Timeout | ratv::Error::NoAnswer(_) => IntegrationSetupError::Timeout,
         ratv::Error::Io(_) | ratv::Error::NoEndpoints => IntegrationSetupError::ConnectionRefused,

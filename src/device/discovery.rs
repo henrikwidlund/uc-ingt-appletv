@@ -45,14 +45,27 @@ fn is_supported_model(model: &str) -> bool {
         .is_some_and(|major| major >= 5)
 }
 
-/// Scan for Apple TV devices. With an address, only that host is asked.
+/// Scan for Apple TV devices. With an address, that host is asked first.
+///
+/// If the host does not answer, a multicast scan is used and only devices with that address
+/// are kept. Some networks forward mDNS multicast between VLANs but block unicast UDP.
 pub async fn scan_apple_tvs(address: Option<IpAddr>) -> Result<Vec<Device>, ratv::Error> {
     let mut options = ScanOptions::default();
     options.timeout = SCAN_TIMEOUT;
-    if let Some(ip) = address {
-        options.targets = vec![SocketAddr::new(ip, MDNS_PORT)];
+    let Some(ip) = address else {
+        let mut devices = scan(&options).await?;
+        devices.retain(is_apple_tv);
+        return Ok(devices);
+    };
+
+    let mut unicast = options.clone();
+    unicast.targets = vec![SocketAddr::new(ip, MDNS_PORT)];
+    let mut devices = scan(&unicast).await?;
+    if devices.is_empty() {
+        info!("no answer from {ip}, scanning the network");
+        devices = scan(&options).await?;
+        devices.retain(|d| d.addresses.contains(&ip));
     }
-    let mut devices = scan(&options).await?;
     devices.retain(is_apple_tv);
     Ok(devices)
 }

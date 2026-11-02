@@ -1659,7 +1659,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 [[package]]
 name = "ratv"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/ratv?rev=292240d785348b2b643d4a756c287b35e6225d2e#292240d785348b2b643d4a756c287b35e6225d2e"
+source = "git+https://github.com/henrikwidlund/ratv?rev=74c2ae2475fed784f5e571d7204b793d8018869f#74c2ae2475fed784f5e571d7204b793d8018869f"
 dependencies = [
  "bytes",
  "getrandom",
@@ -1679,7 +1679,7 @@ dependencies = [
 [[package]]
 name = "ratv-airplay"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/ratv?rev=292240d785348b2b643d4a756c287b35e6225d2e#292240d785348b2b643d4a756c287b35e6225d2e"
+source = "git+https://github.com/henrikwidlund/ratv?rev=74c2ae2475fed784f5e571d7204b793d8018869f#74c2ae2475fed784f5e571d7204b793d8018869f"
 dependencies = [
  "bytes",
  "ratv-codec",
@@ -1690,7 +1690,7 @@ dependencies = [
 [[package]]
 name = "ratv-codec"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/ratv?rev=292240d785348b2b643d4a756c287b35e6225d2e#292240d785348b2b643d4a756c287b35e6225d2e"
+source = "git+https://github.com/henrikwidlund/ratv?rev=74c2ae2475fed784f5e571d7204b793d8018869f#74c2ae2475fed784f5e571d7204b793d8018869f"
 dependencies = [
  "thiserror",
 ]
@@ -1698,7 +1698,7 @@ dependencies = [
 [[package]]
 name = "ratv-companion"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/ratv?rev=292240d785348b2b643d4a756c287b35e6225d2e#292240d785348b2b643d4a756c287b35e6225d2e"
+source = "git+https://github.com/henrikwidlund/ratv?rev=74c2ae2475fed784f5e571d7204b793d8018869f#74c2ae2475fed784f5e571d7204b793d8018869f"
 dependencies = [
  "bytes",
  "ratv-codec",
@@ -1709,7 +1709,7 @@ dependencies = [
 [[package]]
 name = "ratv-discovery"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/ratv?rev=292240d785348b2b643d4a756c287b35e6225d2e#292240d785348b2b643d4a756c287b35e6225d2e"
+source = "git+https://github.com/henrikwidlund/ratv?rev=74c2ae2475fed784f5e571d7204b793d8018869f#74c2ae2475fed784f5e571d7204b793d8018869f"
 dependencies = [
  "thiserror",
 ]
@@ -1717,7 +1717,7 @@ dependencies = [
 [[package]]
 name = "ratv-hap"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/ratv?rev=292240d785348b2b643d4a756c287b35e6225d2e#292240d785348b2b643d4a756c287b35e6225d2e"
+source = "git+https://github.com/henrikwidlund/ratv?rev=74c2ae2475fed784f5e571d7204b793d8018869f#74c2ae2475fed784f5e571d7204b793d8018869f"
 dependencies = [
  "base16ct",
  "chacha20poly1305",
@@ -1737,7 +1737,7 @@ dependencies = [
 [[package]]
 name = "ratv-mrp"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/ratv?rev=292240d785348b2b643d4a756c287b35e6225d2e#292240d785348b2b643d4a756c287b35e6225d2e"
+source = "git+https://github.com/henrikwidlund/ratv?rev=74c2ae2475fed784f5e571d7204b793d8018869f#74c2ae2475fed784f5e571d7204b793d8018869f"
 dependencies = [
  "bytes",
  "prost",
