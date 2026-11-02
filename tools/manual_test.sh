@@ -682,7 +682,7 @@ then 'connected'. The entities are available again." \
 "recent_log 'reconnect in|connected|closed|not found|WARN|ERROR' 25"
 
 step "Configuration file after saving" \
-"Step 'Setup: empty PIN' is done (it saved the configuration)." \
+"Step 'Setup: empty PIN' ended with success. The real PIN saved the configuration." \
 "Press Enter to show the configuration files." \
 "config.json has the mode -rw------- (only the owner can read it).
 There is no config.json.tmp file left." \
