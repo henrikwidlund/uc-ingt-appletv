@@ -1,0 +1,100 @@
+name: Bug report
+description: Report a problem
+title: "Bug: "
+labels: [bug]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the existing issues first to see if the bug is already reported.
+        If you have more information about an existing bug, add a comment. Do not open a new issue.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What is the bug?
+    validations:
+      required: true
+  - type: textarea
+    id: steps_to_reproduce
+    attributes:
+      label: How to reproduce
+      description: Steps to reproduce the behavior.
+      placeholder: |
+        1. ...
+        2. ...
+        3. See error
+    validations:
+      required: true
+  - type: dropdown
+    id: consistent
+    attributes:
+      label: Is the issue consistent?
+      description: Does it happen every time you follow the steps, or only sometimes?
+      options:
+        - "Always"
+        - "Sometimes"
+    validations:
+      required: false
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: input
+    id: intg_version
+    attributes:
+      label: Integration version
+      description: Find it in the Remote UI under Settings/Integrations.
+      placeholder: ex. v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: appletv_model
+    attributes:
+      label: Apple TV model and tvOS version
+      placeholder: Apple TV 4K (3rd generation), tvOS 26.6
+    validations:
+      required: true
+  - type: input
+    id: remote_model
+    attributes:
+      label: Remote model and firmware version
+      placeholder: Remote 3, 2.12.0
+    validations:
+      required: true
+  - type: dropdown
+    id: network
+    attributes:
+      label: Are the Apple TV and the Remote on the same network?
+      description: Say "Different" if you use VLANs or an mDNS reflector.
+      options:
+        - "Same"
+        - "Different"
+    validations:
+      required: true
+  - type: dropdown
+    id: hdmi_cec
+    attributes:
+      label: Does the Apple TV control the volume of the TV or receiver (HDMI CEC)?
+      options:
+        - "Yes"
+        - "No"
+        - "Not sure"
+    validations:
+      required: false
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context and logs
+      description: |
+        Add any other context about the problem. Attach logs from when the issue happens.
+        Logs are in the Remote UI under Settings/Development/Logs.
+        Download the logs for Core and for the integration with Debug level.
+
+        Tip: Click this area and drag in images or log files.
+    validations:
+      required: true
