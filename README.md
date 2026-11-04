@@ -79,6 +79,9 @@ _Apple TV on the network_. The entity ids stay the same.
 
 The driver can also run on a computer as an external integration. The Remote finds it with mDNS.
 
+Each release has binaries for Linux, macOS and Windows, for amd64 and arm64. The Linux binaries are static
+and run on any distribution.
+
 ```shell
 cargo run --release
 ```
