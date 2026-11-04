@@ -131,7 +131,7 @@ jobs:
             bin_ext: ""
           - os: macos
             arch: arm64
-            runner: macos-latest
+            runner: xcode-27
             target: aarch64-apple-darwin
             bin_ext: ""
           - os: windows
