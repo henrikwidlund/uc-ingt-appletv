@@ -27,6 +27,8 @@ jobs:
 
       - name: Cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format check
         run: cargo fmt --all --check
@@ -39,11 +41,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # The targets are the same as in the release build, see build.yml.
         include:
-          - name: linux x64
+          - name: linux amd64
             runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - name: linux arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - name: macos amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
           - name: macos arm64
             runner: macos-latest
+            target: aarch64-apple-darwin
+          - name: windows amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: windows arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
@@ -52,13 +69,22 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        run: rustup update stable && rustup default stable
+        run: rustup update stable && rustup default stable && rustup target add ${{ matrix.target }}
+
+      - name: Use the system linker for build scripts
+        # .cargo/config.toml sets the Remote linker for aarch64-unknown-linux-gnu. Build scripts
+        # are built for the host, which is this target on an arm64 Linux runner.
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=cc" >> "$GITHUB_ENV"
 
       - name: Cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run tests
-        run: cargo test --locked
+        run: cargo test --locked --target ${{ matrix.target }}
 
   msrv:
     name: Minimum Rust version
@@ -78,6 +104,8 @@ jobs:
 
       - name: Cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check
         run: cargo check --locked --all-targets
