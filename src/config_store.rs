@@ -208,6 +208,12 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Queue the save of the configured devices and return at once. A write error is only
+    /// logged. Use it where no caller waits for the result.
+    pub fn queue_devices(&self, devices: &[DeviceConfig]) -> io::Result<()> {
+        self.write_json(self.dir.join(CONFIG_FILE), devices, true)
+    }
+
     /// Load the cache of a device. A missing or broken file gives `None`.
     pub fn load_cache<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
         self.writer.flush();
@@ -461,6 +467,13 @@ mod tests {
         fs::write(dir.join("config.json.tmp"), b"x").expect("tmp");
         let devices = vec![device()];
         store.save_devices(&devices).expect("save");
+        assert_eq!(devices, store.load_devices());
+
+        store.queue_devices(&[]).expect("queue");
+        store.writer.flush();
+        assert_eq!(Vec::<DeviceConfig>::new(), store.load_devices());
+        store.queue_devices(&devices).expect("queue");
+        store.writer.flush();
         assert_eq!(devices, store.load_devices());
 
         #[cfg(unix)]
