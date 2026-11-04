@@ -224,7 +224,7 @@ fn position_attributes(s: &Snapshot, off: bool, now: f64, out: &mut Map<String, 
         out,
         Attr::MediaPositionUpdatedAt,
         chrono::Utc::now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, false)
             .into(),
     );
 }
@@ -665,6 +665,25 @@ mod tests {
         assert_eq!("BUFFERING", state(&s));
         s.power = Power::Off;
         assert_eq!("OFF", state(&s));
+    }
+
+    #[test]
+    fn position_timestamp_has_microseconds_and_offset() {
+        let s = Snapshot {
+            connected: true,
+            ..Snapshot::default()
+        };
+        let mut attrs = Map::new();
+        position_attributes(&s, false, 0.0, &mut attrs);
+        let ts = attrs
+            .get("media_position_updated_at")
+            .and_then(Value::as_str)
+            .expect("timestamp");
+        // Same shape as `2026-11-04T15:37:27.106292+00:00`.
+        assert_eq!(32, ts.len(), "{ts}");
+        assert!(ts.ends_with("+00:00"), "{ts}");
+        assert_eq!(Some('.'), ts.chars().nth(19), "{ts}");
+        assert!(chrono::DateTime::parse_from_rfc3339(ts).is_ok(), "{ts}");
     }
 
     #[test]
