@@ -96,6 +96,20 @@ cargo run --release
 
 `config.json` contains the pairing keys. Only the owner can read it.
 
+### Docker
+
+```shell
+docker run -d --name uc-intg-appletv --network host \
+  -v uc-intg-appletv:/data henrikwidlund/uc-intg-appletv
+```
+
+- The image runs as user `65532`. A named volume works as it is. For a folder on the host, give that user write access.
+- `--network host` lets the driver find the Apple TV and announce itself with mDNS. It works on Linux only.
+- Without host networking, publish the port with `-p 9090:9090` and add `-e UC_DISABLE_MDNS_PUBLISH=true`.
+  Add the driver to the Remote with the IP address of the computer, and enter the IP address of the
+  Apple TV in the setup.
+- The image has no shell. To change a setting, use the variables in the table above.
+
 ## Backup and restore
 
 Run the setup again on the Remote and choose _Backup configuration_. The driver shows the data in a text field.
