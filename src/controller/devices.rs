@@ -102,6 +102,12 @@ impl Controller {
         Ok(())
     }
 
+    /// Save the configuration of all devices without waiting for the disk.
+    fn queue_devices(&self) -> Result<(), ServiceError> {
+        self.store.queue_devices(&self.sorted_configs())?;
+        Ok(())
+    }
+
     pub(super) fn available_entities(&self) -> Vec<AvailableIntgEntity> {
         self.devices
             .values()
@@ -445,7 +451,8 @@ impl Handler<DeviceEvent> for Controller {
                 if address {
                     own.address = cfg.address;
                 }
-                if let Err(e) = self.save_devices() {
+                // The device actors share this thread: do not wait for the disk.
+                if let Err(e) = self.queue_devices() {
                     warn!("Saving the configuration failed: {e}");
                 }
             }
