@@ -23,7 +23,6 @@ env:
   CARGO_TERM_COLOR: always
   APP_NAME: uc-intg-appletv
   ARTIFACT_PREFIX: uc-intg-appletv-rs
-  HASH_FILENAME: uc-intg-appletv-rs.hash
   TARGET: aarch64-unknown-linux-gnu
   TARGET_ID: aarch64_unknown_linux_gnu
   TARGET_TRIPLE: aarch64-none-linux-gnu
@@ -209,11 +208,10 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
 
-      - name: Create hashes
+      - name: Collect artifacts
         run: |
           # Artifacts are extracted into one directory each.
           for D in *; do if [ -d "$D" ]; then mv "$D"/* ./; fi; done
-          for filename in *.tar.gz *.zip; do echo "sha256  $(sha256sum $filename)" >> ${{ env.HASH_FILENAME }}; done
           ls -lah
 
       - name: Create release
@@ -225,7 +223,6 @@ jobs:
           files: |
             *.tar.gz
             *.zip
-            ${{ env.HASH_FILENAME }}
 
       - name: Attest build provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
