@@ -179,7 +179,11 @@ impl WsConn {
         match msg {
             AggregatedMessage::Text(text) => {
                 if self.msg_tracing_in {
-                    debug!("[{}] -> {text}", self.id);
+                    if is_backup_message(&text) {
+                        debug!("[{}] -> <backup data hidden>", self.id);
+                    } else {
+                        debug!("[{}] -> {text}", self.id);
+                    }
                 }
                 self.handle_text_message(&text, sender)
             }
@@ -357,7 +361,11 @@ impl WsConn {
         match serde_json::to_string(msg) {
             Ok(text) => {
                 if msg_tracing_out {
-                    debug!("[{id}] <- {text}");
+                    if is_backup_message(&text) {
+                        debug!("[{id}] <- <backup data hidden>");
+                    } else {
+                        debug!("[{id}] <- {text}");
+                    }
                 }
                 session.text(text).await.map_err(|e| {
                     error!("[{id}] WebSocket send error: {e}");
@@ -370,6 +378,11 @@ impl WsConn {
             }
         }
     }
+}
+
+/// Returns `true` for a setup message with backup data. It contains the pairing credentials.
+fn is_backup_message(text: &str) -> bool {
+    text.contains("\"backup_data\"") || text.contains("\"restore_data\"")
 }
 
 /// Close the session. Does not wait long if the Remote does not read.
@@ -409,4 +422,18 @@ fn service_error_to_ws_message(id: &str, req_id: u32, error: ServiceError) -> Ws
     };
 
     WsMessage::error(req_id, code, ws_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_backup_message;
+
+    #[test]
+    fn backup_messages_are_found() {
+        assert!(is_backup_message(
+            r#"{"input_values":{"restore_data":"x"}}"#
+        ));
+        assert!(is_backup_message(r#"{"settings":[{"id":"backup_data"}]}"#));
+        assert!(!is_backup_message(r#"{"input_values":{"pin":"1234"}}"#));
+    }
 }

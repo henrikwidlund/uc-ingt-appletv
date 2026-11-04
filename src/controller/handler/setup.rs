@@ -4,7 +4,7 @@
 
 //! Driver setup flow: discovery, pairing and reconfiguration.
 
-use crate::config_store::{DeviceConfig, device_key};
+use crate::config_store::{DeviceConfig, backup_json, device_key, parse_backup};
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, operation_mode};
 use crate::device::{UpdateConfig, discovery};
@@ -69,6 +69,12 @@ impl Found {
 pub enum SetupState {
     /// Optional IP address for the discovery.
     Discover,
+    /// First setup: restore a backup or continue with the discovery.
+    RestoreChoice,
+    /// Backup text of the devices. The page is only read by the user.
+    Backup,
+    /// Backup text to restore.
+    Restore,
     /// Reconfigure: device and action.
     ConfigMode,
     /// List of found devices. `manual_address`: the user entered the IP address.
@@ -135,7 +141,8 @@ impl Handler<SetupDriverMsg> for Controller {
             }
             ctx.run_later(ACK_DELAY, move |act, ctx| {
                 if act.is_setup_flow(flow, &ws_id) {
-                    act.request_discover(&ws_id, ctx);
+                    act.setup = Some(SetupState::RestoreChoice);
+                    act.request_input(&ws_id, restore_choice_page(), ctx);
                 }
             });
         }
@@ -277,6 +284,15 @@ impl Controller {
                     }
                 });
             }
+            SetupState::RestoreChoice => self.restore_choice(ws_id, values, ctx),
+            SetupState::Backup => {
+                ctx.run_later(ACK_DELAY, move |act, ctx| {
+                    if act.is_setup_flow(flow, &ws_id) {
+                        act.finish_setup(&ws_id, None, ctx);
+                    }
+                });
+            }
+            SetupState::Restore => self.restore(ws_id, values, ctx)?,
             SetupState::ConfigMode => self.config_mode(ws_id, values, ctx)?,
             SetupState::ChooseDevice {
                 mut found,
@@ -349,6 +365,58 @@ impl Controller {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// First setup: restore a backup or continue with the discovery.
+    fn restore_choice(
+        &self,
+        ws_id: String,
+        values: &HashMap<String, String>,
+        ctx: &mut Context<Self>,
+    ) {
+        let flow = self.setup_flow;
+        let restore = parse_bool(values, "restore_from_backup", false);
+        ctx.run_later(ACK_DELAY, move |act, ctx| {
+            if !act.is_setup_flow(flow, &ws_id) {
+                return;
+            }
+            if restore {
+                act.setup = Some(SetupState::Restore);
+                act.request_input(&ws_id, restore_page(), ctx);
+            } else {
+                act.request_discover(&ws_id, ctx);
+            }
+        });
+    }
+
+    /// Replace the devices with the devices of the pasted backup.
+    ///
+    /// Nothing of the pasted data is logged.
+    fn restore(
+        &mut self,
+        ws_id: String,
+        values: &HashMap<String, String>,
+        ctx: &mut Context<Self>,
+    ) -> Result<(), InputError> {
+        let flow = self.setup_flow;
+        let devices = values
+            .get("restore_data")
+            .and_then(|text| parse_backup(text))
+            .ok_or_else(|| {
+                warn!("[{ws_id}] invalid restore data");
+                InputError::Invalid(Box::new(SetupState::Restore), RESTORE_FAILED.into())
+            })?;
+        info!("[{ws_id}] restoring {} device(s)", devices.len());
+        let error = self.restore_devices(devices, ctx).err().map(|e| {
+            warn!("[{ws_id}] saving the configuration failed: {e}");
+            IntegrationSetupError::Other
+        });
+        ctx.run_later(ACK_DELAY, move |act, ctx| {
+            if act.is_setup_flow(flow, &ws_id) {
+                act.finish_setup(&ws_id, error, ctx);
+            }
+        });
         Ok(())
     }
 
@@ -460,6 +528,30 @@ impl Controller {
                     }
                 });
             }
+            "backup" => {
+                let text = backup_json(&self.sorted_configs())
+                    .filter(|_| !self.devices.is_empty())
+                    .ok_or_else(|| {
+                        InputError::Invalid(
+                            Box::new(SetupState::ConfigMode),
+                            "Nothing to back up".into(),
+                        )
+                    })?;
+                ctx.run_later(ACK_DELAY, move |act, ctx| {
+                    if act.is_setup_flow(flow, &ws_id) {
+                        act.setup = Some(SetupState::Backup);
+                        act.request_input(&ws_id, backup_page(&text), ctx);
+                    }
+                });
+            }
+            "restore" => {
+                ctx.run_later(ACK_DELAY, move |act, ctx| {
+                    if act.is_setup_flow(flow, &ws_id) {
+                        act.setup = Some(SetupState::Restore);
+                        act.request_input(&ws_id, restore_page(), ctx);
+                    }
+                });
+            }
             "reset" => {
                 if let Err(e) = self.reset_devices() {
                     warn!("[{ws_id}] saving the configuration failed: {e}");
@@ -494,6 +586,26 @@ impl Controller {
         self.entities.clear();
         for session in self.sessions.values_mut() {
             session.subscribed_entities.clear();
+        }
+        self.save_devices()
+    }
+
+    /// Replace all devices with the devices of a backup.
+    fn restore_devices(
+        &mut self,
+        devices: Vec<DeviceConfig>,
+        ctx: &Context<Self>,
+    ) -> Result<(), ServiceError> {
+        let keys: Vec<String> = self.devices.keys().map(ToString::to_string).collect();
+        for key in &keys {
+            self.remove_device(key);
+        }
+        self.entities.clear();
+        for session in self.sessions.values_mut() {
+            session.subscribed_entities.clear();
+        }
+        for cfg in devices {
+            self.add_device(cfg, ctx);
         }
         self.save_devices()
     }
@@ -743,6 +855,11 @@ impl Controller {
     fn request_input_again(&mut self, ws_id: &str, message: &str, ctx: &mut Context<Self>) {
         let page = match &self.setup {
             Some(SetupState::Discover) => Some(discover_page()),
+            Some(SetupState::RestoreChoice) => Some(restore_choice_page()),
+            Some(SetupState::Restore) => Some(restore_page()),
+            Some(SetupState::Backup) => backup_json(&self.sorted_configs())
+                .as_deref()
+                .map(backup_page),
             Some(SetupState::ConfigMode) => Some(self.config_mode_page()),
             Some(SetupState::ChooseDevice { found, .. }) => Some(choose_device_page(found)),
             Some(SetupState::Pin { found, .. }) => Some(pin_page(&found.name)),
@@ -850,8 +967,12 @@ impl Controller {
                 json!({ "id": "configure", "label": { "en": "Configure selected device" } }),
                 json!({ "id": "pair", "label": { "en": "Pair selected device again" } }),
                 json!({ "id": "reset", "label": { "en": "Reset configuration and reconfigure" } }),
+                json!({ "id": "backup", "label": { "en": "Backup configuration" } }),
             ]);
         }
+        actions.push(
+            json!({ "id": "restore", "label": { "en": "Restore configuration from backup" } }),
+        );
         let first = devices.first().map(|c| c.key.as_str()).unwrap_or_default();
         json!({
             "title": { "en": "Configuration mode" },
@@ -869,6 +990,63 @@ impl Controller {
             ]
         })
     }
+}
+
+/// Shown for invalid restore data. It must not contain the data.
+const RESTORE_FAILED: &str = "Restore failed or invalid backup data. Please try again.";
+
+fn restore_choice_page() -> Value {
+    json!({
+        "title": { "en": "Restore" },
+        "settings": [
+            {
+                "id": "info",
+                "label": { "en": "Integration upgrade" },
+                "field": { "label": { "value": { "en": "Do you have a configuration backup? Restore it now. Otherwise, continue to add a new device.\n\nYou can make a backup later: run the setup again and choose _Backup configuration_." } } }
+            },
+            {
+                "id": "restore_from_backup",
+                "label": { "en": "Restore from backup" },
+                "field": { "checkbox": { "value": false } }
+            }
+        ]
+    })
+}
+
+fn restore_page() -> Value {
+    json!({
+        "title": { "en": "Restore configuration" },
+        "settings": [
+            {
+                "id": "info",
+                "label": { "en": "Restore configuration" },
+                "field": { "label": { "value": { "en": "Paste the backup below. It replaces all configured devices." } } }
+            },
+            {
+                "id": "restore_data",
+                "label": { "en": "Backup data" },
+                "field": { "password": { "value": "" } }
+            }
+        ]
+    })
+}
+
+fn backup_page(text: &str) -> Value {
+    json!({
+        "title": { "en": "Backup configuration" },
+        "settings": [
+            {
+                "id": "info",
+                "label": { "en": "Backup" },
+                "field": { "label": { "value": { "en": "Copy the data below and keep it in a safe place. It contains the pairing credentials of your Apple TV devices. Do not share it." } } }
+            },
+            {
+                "id": "backup_data",
+                "label": { "en": "Backup data" },
+                "field": { "textarea": { "value": text } }
+            }
+        ]
+    })
 }
 
 fn discover_page() -> Value {
@@ -1066,9 +1244,17 @@ mod tests {
         }
 
         fn input(ws_id: &str, address: &str) -> SetDriverUserDataMsg {
+            values(ws_id, &[("address", address)])
+        }
+
+        fn values(ws_id: &str, values: &[(&str, &str)]) -> SetDriverUserDataMsg {
+            let values = values
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect();
             SetDriverUserDataMsg {
                 ws_id: ws_id.into(),
-                data: IntegrationSetup::InputValues([("address".into(), address.into())].into()),
+                data: IntegrationSetup::InputValues(values),
             }
         }
 
@@ -1097,6 +1283,10 @@ mod tests {
                 .expect("setup started");
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert_eq!(json!("WAIT_USER_ACTION"), last(&events)["state"]);
+            assert_eq!(
+                json!("restore_from_backup"),
+                last(&events)["require_user_action"]["input"]["settings"][1]["id"]
+            );
 
             // Another Remote cannot send input.
             assert!(
@@ -1105,6 +1295,18 @@ mod tests {
                     .await
                     .expect("send")
                     .is_err()
+            );
+
+            // Continue without a restore.
+            controller
+                .send(values("a", &[("restore_from_backup", "false")]))
+                .await
+                .expect("send")
+                .expect("ok");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                json!("address"),
+                last(&events)["require_user_action"]["input"]["settings"][1]["id"]
             );
 
             controller
@@ -1139,6 +1341,47 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("setup started");
+        }
+
+        #[actix::test]
+        async fn invalid_restore_data_is_rejected_without_echo() {
+            let controller = controller("restore");
+            let events = connect(&controller, "a").await;
+            let data = serde_json::from_value(json!({ "setup_data": {} })).expect("setup");
+            controller
+                .send(SetupDriverMsg {
+                    ws_id: "a".into(),
+                    data,
+                })
+                .await
+                .expect("send")
+                .expect("setup started");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            controller
+                .send(values("a", &[("restore_from_backup", "true")]))
+                .await
+                .expect("send")
+                .expect("ok");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                json!("restore_data"),
+                last(&events)["require_user_action"]["input"]["settings"][1]["id"]
+            );
+
+            controller
+                .send(values("a", &[("restore_data", "secret-not-a-backup")]))
+                .await
+                .expect("send")
+                .expect("ok");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let event = last(&events);
+            assert_eq!(json!("INVALID_INPUT"), event["error"]);
+            assert!(!event.to_string().contains("secret-not-a-backup"));
+            assert_eq!(
+                json!("restore_data"),
+                event["require_user_action"]["input"]["settings"][1]["id"]
+            );
         }
     }
 }
