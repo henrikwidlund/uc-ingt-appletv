@@ -91,6 +91,48 @@ pub fn device_key(id: &str) -> String {
     key
 }
 
+/// Version of the backup format.
+const BACKUP_VERSION: u8 = 1;
+
+#[derive(Serialize)]
+struct BackupRef<'a> {
+    version: u8,
+    devices: &'a [DeviceConfig],
+}
+
+#[derive(Deserialize)]
+struct Backup {
+    version: u8,
+    devices: Vec<DeviceConfig>,
+}
+
+/// Serialize the devices for a backup. The text contains the pairing credentials.
+pub fn backup_json(devices: &[DeviceConfig]) -> Option<String> {
+    serde_json::to_string(&BackupRef {
+        version: BACKUP_VERSION,
+        devices,
+    })
+    .ok()
+}
+
+/// Read the devices of a backup. Returns `None` if the text is not a valid backup.
+///
+/// The reason is not returned, because the text contains secrets and parse errors can quote it.
+pub fn parse_backup(text: &str) -> Option<Vec<DeviceConfig>> {
+    let backup: Backup = serde_json::from_str(text.trim()).ok()?;
+    if backup.version != BACKUP_VERSION || backup.devices.is_empty() {
+        return None;
+    }
+    let mut keys: Vec<&str> = Vec::with_capacity(backup.devices.len());
+    for device in &backup.devices {
+        if device.key != device_key(&device.id) || keys.contains(&device.key.as_str()) {
+            return None;
+        }
+        keys.push(&device.key);
+    }
+    Some(backup.devices)
+}
+
 /// 64-bit FNV-1a hash. The output never changes between Rust versions.
 pub fn fnv1a(data: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -442,6 +484,35 @@ mod tests {
         assert_eq!(None, store.load_cache::<Vec<String>>("KEY"));
 
         fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn backup_round_trip() {
+        let devices = vec![device()];
+        let text = backup_json(&devices).expect("backup");
+        assert_eq!(Some(devices), parse_backup(&format!("  {text}\n")));
+    }
+
+    #[test]
+    fn invalid_backups_are_rejected() {
+        let valid = backup_json(&[device()]).expect("backup");
+        assert_eq!(None, parse_backup(""));
+        assert_eq!(None, parse_backup("{broken"));
+        assert_eq!(None, parse_backup(&valid[..valid.len() - 2]));
+        assert_eq!(
+            None,
+            parse_backup(&valid.replace("\"version\":1", "\"version\":2"))
+        );
+        assert_eq!(None, parse_backup(r#"{"version":1,"devices":[]}"#));
+
+        // The key must belong to the identifier.
+        let other = valid.replace(&device_key("AA:BB:CC:DD:EE:FF"), "000000000000");
+        assert_eq!(None, parse_backup(&other));
+
+        // Two devices with the same key.
+        let one = serde_json::to_string(&device()).expect("device");
+        let twice = format!(r#"{{"version":1,"devices":[{one},{one}]}}"#);
+        assert_eq!(None, parse_backup(&twice));
     }
 
     #[test]

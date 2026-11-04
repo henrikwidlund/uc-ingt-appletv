@@ -96,6 +96,17 @@ cargo run --release
 
 `config.json` contains the pairing keys. Only the owner can read it.
 
+## Backup and restore
+
+Run the setup again on the Remote and choose _Backup configuration_. The driver shows the data in a text field.
+Copy it and keep it in a safe place.
+
+To restore, choose _Restore configuration from backup_ in the setup, or tick _Restore from backup_ on the first
+page of a new setup. Paste the data. It replaces all configured devices.
+
+The backup contains the pairing keys of the Apple TV devices. Do not share it. The driver never writes the backup
+data to the log. With `UC_API_MSG_TRACING`, the messages with backup data are hidden.
+
 ## Build
 
 ```shell

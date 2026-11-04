@@ -91,11 +91,16 @@ impl Controller {
         Some(device.cfg)
     }
 
-    /// Save the configuration of all devices.
-    pub(super) fn save_devices(&self) -> Result<(), ServiceError> {
+    /// The configuration of all devices, sorted by name.
+    pub(super) fn sorted_configs(&self) -> Vec<DeviceConfig> {
         let mut devices: Vec<DeviceConfig> = self.devices.values().map(|d| d.cfg.clone()).collect();
         devices.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-        self.store.save_devices(&devices)?;
+        devices
+    }
+
+    /// Save the configuration of all devices.
+    pub(super) fn save_devices(&self) -> Result<(), ServiceError> {
+        self.store.save_devices(&self.sorted_configs())?;
         Ok(())
     }
 
