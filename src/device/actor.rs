@@ -12,7 +12,7 @@ use crate::device::{
     AudioChunk, Browse, Command, Connect, DeviceContext, DeviceEvent, DeviceStatus, Disconnect,
     Stop, UpdateConfig, browse, discovery, now,
 };
-use crate::entities::{self, Capabilities, EntityKind, media_player, remote, select};
+use crate::entities::{self, EntityKind, media_player, remote, select};
 use crate::errors::ServiceError;
 use actix::prelude::*;
 use bytes::Bytes;
@@ -118,7 +118,6 @@ pub struct AppleTvActor {
     controller: Recipient<DeviceEvent>,
     tv: Option<AppleTv>,
     s: Snapshot,
-    caps: Capabilities,
     status: DeviceStatus,
     /// Sends each status change. Commands wait on it while a connect runs.
     status_tx: watch::Sender<DeviceStatus>,
@@ -192,7 +191,6 @@ impl AppleTvActor {
             controller,
             tv: None,
             s,
-            caps: Capabilities::default(),
             status: DeviceStatus::Disconnected,
             status_tx: watch::Sender::new(DeviceStatus::Disconnected),
             want: false,
@@ -764,17 +762,6 @@ impl AppleTvActor {
                 "[{}] outputs: {outputs:?}, own uid: {:?}",
                 self.cfg.name, self.s.own_output_uid
             );
-        }
-        // `None` means unknown: keep the features.
-        if let Some(available) = self.s.volume_available
-            && available != self.caps.volume
-        {
-            info!("[{}] volume control available: {available}", self.cfg.name);
-            self.caps.volume = available;
-            self.controller.do_send(DeviceEvent::Capabilities {
-                key: self.key.clone(),
-                caps: self.caps,
-            });
         }
         dirty
     }

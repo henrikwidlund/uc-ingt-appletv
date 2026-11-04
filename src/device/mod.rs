@@ -12,7 +12,7 @@ pub mod state;
 pub use actor::AppleTvActor;
 
 use crate::config_store::{ConfigStore, DeviceConfig};
-use crate::entities::{Capabilities, EntityKind};
+use crate::entities::EntityKind;
 use crate::errors::ServiceError;
 use crate::server::ArtworkStore;
 use actix::Message;
@@ -59,11 +59,6 @@ pub enum DeviceEvent {
     Changes {
         key: Arc<str>,
         changes: Vec<(EntityKind, Map<String, Value>)>,
-    },
-    /// The entity definitions changed.
-    Capabilities {
-        key: Arc<str>,
-        caps: Capabilities,
     },
     /// The configuration changed and must be saved.
     Config {
