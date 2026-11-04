@@ -8,7 +8,7 @@ use crate::controller::{Controller, R2AudioChunkMsg, R2RequestMsg};
 use crate::device::{
     AppleTvActor, AudioChunk, Browse, Command, Connect, DeviceEvent, DeviceStatus, Disconnect, Stop,
 };
-use crate::entities::{self, Capabilities, EntityKind};
+use crate::entities::{self, EntityKind};
 use crate::errors::ServiceError;
 use crate::util::{DeserializeMsgData, return_fut_err};
 use actix::{Actor, Addr, AsyncContext, Context, Handler, Message, ResponseFuture};
@@ -41,7 +41,6 @@ struct EndVoiceSession(u32);
 pub(super) struct Device {
     pub cfg: DeviceConfig,
     pub addr: Addr<AppleTvActor>,
-    pub caps: Capabilities,
     pub status: DeviceStatus,
 }
 
@@ -65,7 +64,6 @@ impl Controller {
             Device {
                 cfg,
                 addr,
-                caps: Capabilities::default(),
                 status: DeviceStatus::Disconnected,
             },
         );
@@ -107,7 +105,7 @@ impl Controller {
     pub(super) fn available_entities(&self) -> Vec<AvailableIntgEntity> {
         self.devices
             .values()
-            .flat_map(|d| entities::definitions(&d.cfg, d.caps))
+            .flat_map(|d| entities::definitions(&d.cfg))
             .collect()
     }
 
@@ -420,7 +418,6 @@ impl Handler<DeviceEvent> for Controller {
 
     fn handle(&mut self, msg: DeviceEvent, _: &mut Self::Context) {
         if let DeviceEvent::Changes { key, .. }
-        | DeviceEvent::Capabilities { key, .. }
         | DeviceEvent::Config { key, .. }
         | DeviceEvent::Status { key, .. } = &msg
             && !self.is_current(key)
@@ -430,17 +427,6 @@ impl Handler<DeviceEvent> for Controller {
         }
         match msg {
             DeviceEvent::Changes { key, changes } => self.apply_changes(&key, changes),
-            DeviceEvent::Capabilities { key, caps } => {
-                let Some(device) = self.devices.get_mut(&*key) else {
-                    return;
-                };
-                device.caps = caps;
-                let definition = entities::definition(&device.cfg, caps, EntityKind::MediaPlayer);
-                match serde_json::to_value(definition) {
-                    Ok(data) => self.broadcast("entity_available", EventCategory::Entity, &data),
-                    Err(e) => warn!("entity_available serialize error: {e}"),
-                }
-            }
             DeviceEvent::Config { key, cfg } => {
                 let Some(device) = self.devices.get_mut(&*key) else {
                     return;

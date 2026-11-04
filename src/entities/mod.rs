@@ -128,28 +128,15 @@ impl EntityKind {
     }
 }
 
-/// Capabilities that change the entity definitions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Capabilities {
-    /// `false` if the Apple TV cannot change the volume, for example HDMI audio without CEC.
-    pub volume: bool,
-}
-
-impl Default for Capabilities {
-    fn default() -> Self {
-        Self { volume: true }
-    }
-}
-
 /// Build all entity definitions of an Apple TV.
-pub fn definitions(cfg: &DeviceConfig, caps: Capabilities) -> Vec<AvailableIntgEntity> {
+pub fn definitions(cfg: &DeviceConfig) -> Vec<AvailableIntgEntity> {
     EntityKind::all()
-        .map(|kind| definition(cfg, caps, kind))
+        .map(|kind| definition(cfg, kind))
         .collect()
 }
 
 /// Build the definition of one entity.
-pub fn definition(cfg: &DeviceConfig, caps: Capabilities, kind: EntityKind) -> AvailableIntgEntity {
+pub fn definition(cfg: &DeviceConfig, kind: EntityKind) -> AvailableIntgEntity {
     let entity = AvailableIntgEntity {
         entity_id: kind.entity_id(&cfg.key),
         device_id: None,
@@ -164,7 +151,7 @@ pub fn definition(cfg: &DeviceConfig, caps: Capabilities, kind: EntityKind) -> A
         attributes: None,
     };
     match kind {
-        EntityKind::MediaPlayer => media_player::definition(entity, caps),
+        EntityKind::MediaPlayer => media_player::definition(entity),
         EntityKind::Remote => remote::definition(entity),
         EntityKind::VoiceAssistant => voice::definition(entity),
         EntityKind::Select(_) => entity,

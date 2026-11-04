@@ -4,7 +4,7 @@
 //! Media player entity.
 
 use crate::device::state::{Dirty, Power, Snapshot};
-use crate::entities::{Capabilities, SelectKind};
+use crate::entities::SelectKind;
 use crate::errors::ServiceError;
 use ratv::Key;
 use ratv::mrp::{MediaSubType, MediaType, PlaybackState, RepeatMode, ShuffleMode};
@@ -89,15 +89,14 @@ const VOLUME_FEATURES: &[F] = &[
 /// Browse and play media ids are always stable: bit 0.
 const STABLE_ID_SUPPORT: u8 = 1;
 
-pub fn definition(mut entity: AvailableIntgEntity, caps: Capabilities) -> AvailableIntgEntity {
+pub fn definition(mut entity: AvailableIntgEntity) -> AvailableIntgEntity {
     use strum::VariantArray;
 
-    let volume = if caps.volume { VOLUME_FEATURES } else { &[] };
     entity.device_class = Some(MediaPlayerDeviceClass::TV.as_ref().into());
     entity.features = Some(
         FEATURES
             .iter()
-            .chain(volume)
+            .chain(VOLUME_FEATURES)
             .map(|f| f.as_ref().to_string())
             .collect(),
     );
