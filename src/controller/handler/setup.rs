@@ -10,6 +10,7 @@ use crate::controller::{Controller, operation_mode};
 use crate::device::{UpdateConfig, discovery};
 use crate::entities::EntityKind;
 use crate::errors::ServiceError;
+use crate::logging;
 use actix::{ActorFutureExt, AsyncContext, Context, Handler, Message, WrapFuture};
 use log::{debug, info, warn};
 use ratv::discovery::Device;
@@ -142,7 +143,8 @@ impl Handler<SetupDriverMsg> for Controller {
             ctx.run_later(ACK_DELAY, move |act, ctx| {
                 if act.is_setup_flow(flow, &ws_id) {
                     act.setup = Some(SetupState::RestoreChoice);
-                    act.request_input(&ws_id, restore_choice_page(), ctx);
+                    let page = restore_choice_page(act.driver_settings.debug_log);
+                    act.request_input(&ws_id, page, ctx);
                 }
             });
         }
@@ -370,11 +372,13 @@ impl Controller {
 
     /// First setup: restore a backup or continue with the discovery.
     fn restore_choice(
-        &self,
+        &mut self,
         ws_id: String,
         values: &HashMap<String, String>,
         ctx: &mut Context<Self>,
     ) {
+        let debug_log = parse_bool(values, "debug_log", self.driver_settings.debug_log);
+        self.set_debug_log(&ws_id, debug_log);
         let flow = self.setup_flow;
         let restore = parse_bool(values, "restore_from_backup", false);
         ctx.run_later(ACK_DELAY, move |act, ctx| {
@@ -480,7 +484,12 @@ impl Controller {
         let flow = self.setup_flow;
         let action = values.get("action").map(String::as_str).unwrap_or_default();
         let key = values.get("choice").map(String::as_str).unwrap_or_default();
+        self.set_debug_log(
+            &ws_id,
+            parse_bool(values, "debug_log", self.driver_settings.debug_log),
+        );
         match action {
+            "settings" => self.finish_setup_later(ws_id, ctx),
             "add" => {
                 ctx.run_later(ACK_DELAY, move |act, ctx| {
                     if act.is_setup_flow(flow, &ws_id) {
@@ -500,11 +509,7 @@ impl Controller {
                     warn!("[{ws_id}] saving the configuration failed: {e}");
                     return Err(InputError::Failed(IntegrationSetupError::Other));
                 }
-                ctx.run_later(ACK_DELAY, move |act, ctx| {
-                    if act.is_setup_flow(flow, &ws_id) {
-                        act.finish_setup(&ws_id, None, ctx);
-                    }
-                });
+                self.finish_setup_later(ws_id, ctx);
             }
             "configure" => {
                 let cfg = self
@@ -572,6 +577,36 @@ impl Controller {
             }
         }
         Ok(())
+    }
+
+    /// End the setup after the request was acknowledged.
+    fn finish_setup_later(&self, ws_id: String, ctx: &mut Context<Self>) {
+        let flow = self.setup_flow;
+        ctx.run_later(ACK_DELAY, move |act, ctx| {
+            if act.is_setup_flow(flow, &ws_id) {
+                act.finish_setup(&ws_id, None, ctx);
+            }
+        });
+    }
+
+    /// Turn the debug log on or off and save the setting.
+    fn set_debug_log(&mut self, ws_id: &str, on: bool) {
+        if self.driver_settings.debug_log == on {
+            return;
+        }
+        self.driver_settings.debug_log = on;
+        logging::set_debug(on);
+        if logging::env_filter() {
+            info!(
+                "[{ws_id}] debug log {}, RUST_LOG is used instead",
+                if on { "saved" } else { "off" }
+            );
+        } else {
+            info!("[{ws_id}] debug log {}", if on { "on" } else { "off" });
+        }
+        if let Err(e) = self.store.save_settings(self.driver_settings) {
+            warn!("[{ws_id}] saving the settings failed: {e}");
+        }
     }
 
     /// Remove all devices and their entities.
@@ -855,7 +890,9 @@ impl Controller {
     fn request_input_again(&mut self, ws_id: &str, message: &str, ctx: &mut Context<Self>) {
         let page = match &self.setup {
             Some(SetupState::Discover) => Some(discover_page()),
-            Some(SetupState::RestoreChoice) => Some(restore_choice_page()),
+            Some(SetupState::RestoreChoice) => {
+                Some(restore_choice_page(self.driver_settings.debug_log))
+            }
             Some(SetupState::Restore) => Some(restore_page()),
             Some(SetupState::Backup) => backup_json(&self.sorted_configs())
                 .as_deref()
@@ -970,9 +1007,10 @@ impl Controller {
                 json!({ "id": "backup", "label": { "en": "Backup configuration" } }),
             ]);
         }
-        actions.push(
+        actions.extend([
             json!({ "id": "restore", "label": { "en": "Restore configuration from backup" } }),
-        );
+            json!({ "id": "settings", "label": { "en": "Save settings" } }),
+        ]);
         let first = devices.first().map(|c| c.key.as_str()).unwrap_or_default();
         json!({
             "title": { "en": "Configuration mode" },
@@ -986,7 +1024,8 @@ impl Controller {
                     "id": "action",
                     "label": { "en": "Action" },
                     "field": { "dropdown": { "value": "add", "items": actions } }
-                }
+                },
+                debug_log_field(self.driver_settings.debug_log)
             ]
         })
     }
@@ -995,7 +1034,7 @@ impl Controller {
 /// Shown for invalid restore data. It must not contain the data.
 const RESTORE_FAILED: &str = "Restore failed or invalid backup data. Please try again.";
 
-fn restore_choice_page() -> Value {
+fn restore_choice_page(debug_log: bool) -> Value {
     json!({
         "title": { "en": "Restore" },
         "settings": [
@@ -1008,7 +1047,8 @@ fn restore_choice_page() -> Value {
                 "id": "restore_from_backup",
                 "label": { "en": "Restore from backup" },
                 "field": { "checkbox": { "value": false } }
-            }
+            },
+            debug_log_field(debug_log)
         ]
     })
 }
@@ -1064,6 +1104,14 @@ fn discover_page() -> Value {
                 "field": { "text": { "value": "" } }
             }
         ]
+    })
+}
+
+fn debug_log_field(value: bool) -> Value {
+    json!({
+        "id": "debug_log",
+        "label": { "en": "Debug log (for error reports, more log lines)" },
+        "field": { "checkbox": { "value": value } }
     })
 }
 
@@ -1187,6 +1235,7 @@ mod tests {
     }
 
     mod flow {
+        use crate::config_store::DriverSettings;
         use crate::configuration::{HeartbeatSettings, Settings};
         use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
         use crate::controller::{Controller, NewR2Session, R2SessionDisconnect, SendWsMessage};
@@ -1227,7 +1276,13 @@ mod tests {
                 heartbeat: HeartbeatSettings::default(),
             };
             let metadata = serde_json::from_value(json!({})).expect("metadata");
-            Controller::new(settings, metadata, ArtworkStore::new(dir.join("artwork"))).start()
+            Controller::new(
+                settings,
+                DriverSettings::default(),
+                metadata,
+                ArtworkStore::new(dir.join("artwork")),
+            )
+            .start()
         }
 
         async fn connect(controller: &Addr<Controller>, id: &str) -> Arc<Mutex<Vec<Value>>> {

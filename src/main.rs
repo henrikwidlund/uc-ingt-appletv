@@ -13,6 +13,7 @@ mod controller;
 mod device;
 mod entities;
 mod errors;
+mod logging;
 mod server;
 mod startup;
 mod util;
@@ -32,10 +33,13 @@ use uc_api::util::text_from_language_map;
 
 #[actix_web::main]
 async fn main() -> io::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    info!("Starting {} {APP_VERSION}", built_info::PKG_NAME);
-
     let settings = Settings::from_env();
+    let driver_settings = config_store::load_settings(&settings.config_home);
+    logging::init(driver_settings.debug_log);
+    info!("Starting {} {APP_VERSION}", built_info::PKG_NAME);
+    if driver_settings.debug_log && !logging::env_filter() {
+        info!("Debug log is on");
+    }
     let driver_metadata = configuration::get_driver_metadata()?;
     let address = format!("{}:{}", settings.interface, settings.http_port);
     let listener = TcpListener::bind(&address)?;
@@ -44,8 +48,15 @@ async fn main() -> io::Result<()> {
     let artwork = ArtworkStore::new(settings.config_home.join("artwork"));
     let heartbeat = web::Data::new(settings.heartbeat);
     let api_port = settings.http_port;
-    let controller =
-        web::Data::new(Controller::new(settings, driver_metadata.clone(), artwork.clone()).start());
+    let controller = web::Data::new(
+        Controller::new(
+            settings,
+            driver_settings,
+            driver_metadata.clone(),
+            artwork.clone(),
+        )
+        .start(),
+    );
     let artwork = web::Data::new(artwork);
 
     let http_server = HttpServer::new(move || {

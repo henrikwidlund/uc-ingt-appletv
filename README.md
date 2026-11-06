@@ -113,6 +113,13 @@ docker run -d --name uc-intg-appletv --network host \
   Apple TV in the setup.
 - The image has no shell. To change a setting, use the variables in the table above.
 
+## Debug log
+
+For an error report, turn on the debug log: tick _Debug log_ on the first page of a new setup, or run the setup
+again, tick _Debug log_ and choose _Save settings_.
+The driver and ratv then write more lines to the log. It takes effect at once and stays on after a restart.
+Turn it off the same way when you are done. `RUST_LOG` overrides this setting.
+
 ## Backup and restore
 
 Run the setup again on the Remote and choose _Backup configuration_. The driver shows the data in a text field.
