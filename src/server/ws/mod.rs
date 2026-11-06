@@ -31,6 +31,16 @@ struct WsConn {
     msg_tracing_in: bool,
     /// Log every outgoing message.
     msg_tracing_out: bool,
+    /// Audio received in the last voice session.
+    voice: VoiceCount,
+}
+
+/// Audio received from the Remote in one voice session.
+#[derive(Debug, Default, Clone, Copy)]
+struct VoiceCount {
+    session_id: u32,
+    chunks: u32,
+    bytes: u64,
 }
 
 impl WsConn {
@@ -47,6 +57,7 @@ impl WsConn {
             heartbeat,
             msg_tracing_in: msg_tracing == "all" || msg_tracing == "in",
             msg_tracing_out: msg_tracing == "all" || msg_tracing == "out",
+            voice: VoiceCount::default(),
         }
     }
 }

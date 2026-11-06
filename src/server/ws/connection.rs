@@ -8,7 +8,7 @@ use crate::controller::{
     NewR2Session, R2AudioChunkMsg, R2SessionDisconnect, SendWsMessage, VOICE_SAMPLE_RATE,
 };
 use crate::errors::ServiceError;
-use crate::server::ws::WsConn;
+use crate::server::ws::{VoiceCount, WsConn};
 use actix::{Actor, ActorFutureExt, Addr, AsyncContext, Handler, WrapFuture};
 use actix_ws::{AggregatedMessage, CloseCode, CloseReason, Session};
 use bytes::Bytes;
@@ -276,7 +276,7 @@ impl WsConn {
     }
 
     /// Handle a binary protobuf message. Only voice audio is supported.
-    async fn handle_binary_message(&self, data: Bytes) -> Result<(), Option<CloseReason>> {
+    async fn handle_binary_message(&mut self, data: Bytes) -> Result<(), Option<CloseReason>> {
         let msg = IntegrationMessage::decode(data).map_err(|e| {
             error!("[{}] Invalid binary message: {e:?}", self.id);
             None
@@ -288,6 +288,10 @@ impl WsConn {
 
         match msg {
             ProtoMsg::VoiceBegin(begin) => {
+                self.voice = VoiceCount {
+                    session_id: begin.session_id,
+                    ..VoiceCount::default()
+                };
                 if let Some(cfg) = begin.configuration {
                     info!(
                         "[{}] => voice_begin({}): {cfg:?}",
@@ -319,6 +323,14 @@ impl WsConn {
                 Ok(())
             }
             ProtoMsg::VoiceData(data) => {
+                if self.voice.session_id != data.session_id {
+                    self.voice = VoiceCount {
+                        session_id: data.session_id,
+                        ..VoiceCount::default()
+                    };
+                }
+                self.voice.chunks += 1;
+                self.voice.bytes += data.samples.len() as u64;
                 match self
                     .controller_addr
                     .send(R2AudioChunkMsg {
@@ -343,7 +355,17 @@ impl WsConn {
                 }
             }
             ProtoMsg::VoiceEnd(end) => {
-                info!("[{}] => voice_end({})", self.id, end.session_id);
+                let count = if self.voice.session_id == end.session_id {
+                    self.voice
+                } else {
+                    VoiceCount::default()
+                };
+                // 16 bit mono samples.
+                let secs = count.bytes as f64 / f64::from(VOICE_SAMPLE_RATE * 2);
+                info!(
+                    "[{}] => voice_end({}): {} chunks, {} bytes, {secs:.2} s of audio",
+                    self.id, end.session_id, count.chunks, count.bytes
+                );
                 self.controller_addr
                     .do_send(R2AudioChunkMsg::end(end.session_id));
                 Ok(())

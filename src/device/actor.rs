@@ -1150,6 +1150,8 @@ impl AppleTvActor {
         let controller = self.controller.clone();
         let ready_id = entity_id.clone();
         let lock = self.siri_lock.clone();
+        let ended = replaced.clone();
+        // Returns the number of audio chunks sent to the Apple TV.
         let fut = move |tv: Option<AppleTv>| async move {
             let tv = tv.ok_or(ratv::Error::NotConnected("Apple TV"))?;
             if tv.mrp().is_none() {
@@ -1161,7 +1163,7 @@ impl AppleTvActor {
                 .map_err(|_| ratv::Error::SiriActive)?;
             // Replaced while it waited: do not start it.
             if replaced.load(Ordering::Relaxed) {
-                return Ok(());
+                return Ok(None);
             }
             let mut siri = tv.start_siri().await?;
             controller.do_send(DeviceEvent::Assistant(AssistantEvent::Ready {
@@ -1169,6 +1171,7 @@ impl AppleTvActor {
                 session_id,
             }));
             let mut pcm = Vec::new();
+            let mut chunks = 0_u32;
             loop {
                 match tokio::time::timeout(SIRI_AUDIO_TIMEOUT, rx.recv()).await {
                     Ok(Some(chunk)) if !chunk.is_empty() => {
@@ -1181,12 +1184,14 @@ impl AppleTvActor {
                                 .map(|b| i16::from_le_bytes(*b)),
                         );
                         siri.push_pcm(&pcm).await?;
+                        chunks += 1;
                     }
                     // End of audio, session replaced or timeout.
                     _ => break,
                 }
             }
-            siri.finish().await
+            siri.finish().await?;
+            Ok(Some(chunks))
         };
         let start = connect_ended(connecting)
             .into_actor(self)
@@ -1199,26 +1204,49 @@ impl AppleTvActor {
             {
                 act.siri = None;
             }
-            let event = match result {
-                Ok(()) => AssistantEvent::Finished {
-                    entity_id,
-                    session_id,
-                },
-                Err(e) => {
-                    warn!("[{}] Siri failed: {e}", act.cfg.name);
-                    AssistantEvent::Error {
-                        entity_id,
-                        session_id,
-                        data: AssistantError {
-                            code: AssistantErrorCode::UnexpectedError,
-                            message: e.to_string(),
-                        },
-                    }
-                }
-            };
+            let replaced = ended.load(Ordering::Relaxed);
+            let event = siri_event(&act.cfg.name, entity_id, session_id, result, replaced);
             act.controller.do_send(DeviceEvent::Assistant(event));
         }));
         Ok(())
+    }
+}
+
+/// Assistant event for the end of a Siri session. `chunks` is the number of audio chunks sent to
+/// the Apple TV, `None` if Siri was not started.
+fn siri_event(
+    name: &str,
+    entity_id: String,
+    session_id: u32,
+    chunks: Result<Option<u32>, ratv::Error>,
+    replaced: bool,
+) -> AssistantEvent {
+    // ratv returns `SiriNoAudio` from `finish` when no audio was pushed.
+    let no_audio = matches!(chunks, Ok(Some(0)) | Err(ratv::Error::SiriNoAudio));
+    let message = match chunks {
+        // No audio is an error, unless a newer session replaced this one.
+        _ if no_audio && !replaced => {
+            warn!("[{name}] Siri session {session_id}: no audio from the Remote");
+            "no audio from the Remote".to_string()
+        }
+        Ok(_) | Err(ratv::Error::SiriNoAudio) => {
+            return AssistantEvent::Finished {
+                entity_id,
+                session_id,
+            };
+        }
+        Err(e) => {
+            warn!("[{name}] Siri failed: {e}");
+            e.to_string()
+        }
+    };
+    AssistantEvent::Error {
+        entity_id,
+        session_id,
+        data: AssistantError {
+            code: AssistantErrorCode::UnexpectedError,
+            message,
+        },
     }
 }
 
@@ -1529,6 +1557,28 @@ mod tests {
             &Error::from(ErrorKind::ConnectionRefused).into()
         ));
         assert!(!network_not_ready(&ratv::Error::Timeout));
+    }
+
+    #[test]
+    fn siri_without_audio_is_an_error() {
+        let event = |chunks, replaced| match siri_event("tv", "voice".into(), 1, chunks, replaced) {
+            AssistantEvent::Finished { .. } => None,
+            AssistantEvent::Error { data, .. } => Some(data.message),
+            _ => Some(String::new()),
+        };
+        assert_eq!(
+            Some("no audio from the Remote".into()),
+            event(Ok(Some(0)), false)
+        );
+        assert_eq!(None, event(Ok(Some(0)), true));
+        assert_eq!(
+            Some("no audio from the Remote".into()),
+            event(Err(ratv::Error::SiriNoAudio), false)
+        );
+        assert_eq!(None, event(Err(ratv::Error::SiriNoAudio), true));
+        assert_eq!(None, event(Ok(Some(3)), false));
+        assert_eq!(None, event(Ok(None), false));
+        assert!(event(Err(ratv::Error::Timeout), false).is_some());
     }
 
     #[test]

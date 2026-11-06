@@ -22,6 +22,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CONFIG_FILE: &str = "config.json";
+const SETTINGS_FILE: &str = "settings.json";
 /// Length of the device key used in entity ids.
 pub const KEY_LEN: usize = 12;
 
@@ -142,6 +143,24 @@ pub fn fnv1a(data: &[u8]) -> u64 {
         .fold(OFFSET, |h, b| (h ^ u64::from(*b)).wrapping_mul(PRIME))
 }
 
+/// Driver settings that are not part of a device.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriverSettings {
+    /// Log debug messages of the driver and ratv.
+    #[serde(default)]
+    pub debug_log: bool,
+}
+
+/// Load the driver settings. A missing or broken file gives the defaults.
+///
+/// It is a free function, because the logger needs the settings before the store exists.
+pub fn load_settings(dir: &Path) -> DriverSettings {
+    read_json(&dir.join(SETTINGS_FILE))
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
 /// Reads and writes the configuration files.
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
@@ -212,6 +231,11 @@ impl ConfigStore {
     /// logged. Use it where no caller waits for the result.
     pub fn queue_devices(&self, devices: &[DeviceConfig]) -> io::Result<()> {
         self.write_json(self.dir.join(CONFIG_FILE), devices, true)
+    }
+
+    /// Queue the save of the driver settings. A write error is only logged.
+    pub fn save_settings(&self, settings: DriverSettings) -> io::Result<()> {
+        self.write_json(self.dir.join(SETTINGS_FILE), &settings, false)
     }
 
     /// Load the cache of a device. A missing or broken file gives `None`.
@@ -454,6 +478,27 @@ mod tests {
         assert!(d.matches(["X", "AA:BB:CC:DD:EE:FF"].into_iter()));
         assert!(d.matches(std::iter::once("UUID-1")));
         assert!(!d.matches(["UUID-2", "AA:BB:CC:DD:EE:11"].into_iter()));
+    }
+
+    #[test]
+    fn settings_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "uc-intg-appletv-test-settings-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("dir");
+        assert_eq!(DriverSettings::default(), load_settings(&dir));
+
+        let store = ConfigStore::new(&dir);
+        let settings = DriverSettings { debug_log: true };
+        store.save_settings(settings).expect("save");
+        store.writer.flush();
+        assert_eq!(settings, load_settings(&dir));
+
+        // A broken file gives the defaults.
+        fs::write(dir.join(SETTINGS_FILE), b"{").expect("write");
+        assert_eq!(DriverSettings::default(), load_settings(&dir));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

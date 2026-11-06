@@ -10,7 +10,7 @@ mod messages;
 
 pub use messages::*;
 
-use crate::config_store::ConfigStore;
+use crate::config_store::{ConfigStore, DriverSettings};
 use crate::configuration::{DEF_SETUP_TIMEOUT_SEC, ENV_SETUP_TIMEOUT, Settings};
 use crate::controller::devices::Device;
 use crate::controller::handler::{AbortDriverSetup, SetupState};
@@ -109,6 +109,7 @@ pub struct Controller {
     /// Id of the setup flow. Changes on each start and end, so that old setup tasks are ignored.
     setup_flow: u32,
     store: ConfigStore,
+    driver_settings: DriverSettings,
     device_ctx: Arc<DeviceContext>,
     /// Configured Apple TVs by device key.
     devices: HashMap<Arc<str>, Device>,
@@ -121,6 +122,7 @@ pub struct Controller {
 impl Controller {
     pub fn new(
         settings: Settings,
+        driver_settings: DriverSettings,
         drv_metadata: IntegrationDriverUpdate,
         artwork: ArtworkStore,
     ) -> Self {
@@ -147,6 +149,7 @@ impl Controller {
             setup_owner: None,
             setup_flow: 0,
             store,
+            driver_settings,
             device_ctx,
             devices: HashMap::default(),
             entities: HashMap::default(),
