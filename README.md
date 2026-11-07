@@ -46,6 +46,7 @@ One pairing with one PIN covers all features.
   Tested with an Apple TV 4K (1st generation) on tvOS 26.6.1.
 - The Apple TV and the Remote are on the same network or use a mDNS reflector. Multicast DNS (mDNS) must not be blocked.
 - On the Apple TV, in the AirPlay settings: set _Allow Access_ to _Anyone on the Same Network_.
+- For the voice assistant, Siri must be on in the Apple TV settings: Settings > General > Siri.
 - A fixed IP address for the Apple TV (DHCP reservation) is recommended. The driver then finds the Apple TV
   faster after a restart.
 

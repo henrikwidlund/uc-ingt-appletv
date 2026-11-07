@@ -1235,6 +1235,12 @@ fn siri_event(
                 session_id,
             };
         }
+        // Seen when Siri is off on the Apple TV.
+        Err(e @ ratv::Error::SiriNotRecording) => {
+            warn!("[{name}] Siri failed: {e}. Is Siri on in the Apple TV settings?");
+            "Apple TV did not start listening. Check that Siri is on: Settings > General > Siri."
+                .to_string()
+        }
         Err(e) => {
             warn!("[{name}] Siri failed: {e}");
             e.to_string()
@@ -1579,6 +1585,10 @@ mod tests {
         assert_eq!(None, event(Ok(Some(3)), false));
         assert_eq!(None, event(Ok(None), false));
         assert!(event(Err(ratv::Error::Timeout), false).is_some());
+        assert!(
+            event(Err(ratv::Error::SiriNotRecording), false)
+                .is_some_and(|m| m.contains("Siri is on"))
+        );
     }
 
     #[test]

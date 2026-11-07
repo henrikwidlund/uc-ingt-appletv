@@ -27,7 +27,7 @@
         "field": {
           "label": {
             "value": {
-              "en": "The integration finds Apple TV devices on the network.\n\n- Apple TV HD or Apple TV 4K is required.\n- The Apple TV must be on the same network as the Remote.\n- A PIN is shown on the TV during pairing.\n- Set AirPlay access on the Apple TV to \"Anyone on the Same Network\"."
+              "en": "The integration finds Apple TV devices on the network.\n\n- Apple TV HD or Apple TV 4K is required.\n- Enter the IP address of the Apple TV in the setup, or leave it empty to search the network.\n- A PIN is shown on the TV during pairing.\n- Set AirPlay access on the Apple TV to \"Anyone on the Same Network\".\n- For voice control, turn on Siri on the Apple TV: Settings > General > Siri."
             }
           }
         }
